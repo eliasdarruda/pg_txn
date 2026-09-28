@@ -92,10 +92,23 @@ defmodule PgTxn.Tx do
 
   defp key(%__MODULE__{ref: ref}), do: {__MODULE__, ref}
 
+  @doc false
+  # raises unless tx can be used here (its run is in progress in this process)
+  def check!(tx), do: state!(tx) && :ok
+
   defp state!(tx) do
-    Process.get(key(tx)) ||
-      raise ArgumentError,
-            "pg_txn: this transaction is not running in this process (use tx only inside its transaction function, in the process running it)"
+    cond do
+      Process.get(PgTxn.Call.in_effect_key()) ->
+        raise ArgumentError,
+              "pg_txn: tx cannot be used inside an effect's or a spawned function: it runs outside the transaction. Return what you need from the effect and use it after"
+
+      state = Process.get(key(tx)) ->
+        state
+
+      true ->
+        raise ArgumentError,
+              "pg_txn: this transaction has ended, or is not running in this process: use tx only inside its transaction function, in the process running it"
+    end
   end
 
   defp put(tx, state), do: Process.put(key(tx), state)

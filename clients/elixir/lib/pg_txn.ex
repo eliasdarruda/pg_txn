@@ -70,11 +70,38 @@ defmodule PgTxn do
   such keys), `:id` (the transaction
   id, default a new uuid), `:lease_ms`, and any `Repo.transaction/2` option
   (e.g. `:timeout`). Cannot be called inside another Repo transaction.
+
+  With an `:id`, it is idempotent: if a transaction with that id exists, it
+  is not run again (`fun` is not called); this waits for it to end (up to
+  `:key_wait_ms`) and returns its outcome like `wait/3`: `{:ok, output}`
+  when it committed, `{:error, %PgTxn.TransactionFailedError{}}` when it
+  failed or was abandoned.
   """
-  @spec transaction(repo, (tx -> result), keyword) :: {:ok, result} | {:error, term} when result: term
+  @spec transaction(repo, (tx -> result), keyword) ::
+          {:ok, result} | {:error, term} | {:error, TransactionFailedError.t() | :timeout}
+        when result: term
   def transaction(repo, fun, opts \\ []) when is_function(fun, 1) do
-    opts = if Loop.keys(opts), do: Keyword.put(opts, :start, {nil, nil}), else: opts
-    Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, opts)
+    case opts[:id] && ended(repo, opts[:id]) do
+      outcome when is_tuple(outcome) ->
+        outcome
+
+      _new ->
+        opts = if Loop.keys(opts), do: Keyword.put(opts, :start, {nil, nil}), else: opts
+        Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, opts)
+    end
+  end
+
+  # the outcome of a transaction that exists (waiting for it if another
+  # process runs it), or nil; each drive has an owner of its own, so a
+  # recorded transaction is never this call's
+  defp ended(repo, id) do
+    unless repo.in_transaction?() do
+      Schema.ensure!(repo)
+
+      if SQL.one(repo, "SELECT status FROM txn.transactions WHERE id = $1::text::uuid", [id]) do
+        wait(repo, id, Config.get(repo, :key_wait_ms))
+      end
+    end
   end
 
   @doc """
@@ -126,7 +153,10 @@ defmodule PgTxn do
 
   @doc "When the transaction started: the same in every run."
   @spec now(tx) :: DateTime.t()
-  def now(%Tx{started_at: t}), do: t
+  def now(%Tx{started_at: t} = tx) do
+    Tx.check!(tx)
+    t
+  end
 
   @doc """
   A random-looking UUID that is the same in every run (the n-th call of a run
@@ -157,6 +187,7 @@ defmodule PgTxn do
   @spec spawn(tx | repo, effect_fun, keyword) :: String.t()
   def spawn(tx_or_repo, fun, opts \\ []) when is_function(fun, 0) or is_function(fun, 1) do
     Call.validate!(opts)
+    with %Tx{} = tx <- tx_or_repo, do: Tx.check!(tx)
     repo = repo!(tx_or_repo)
     unless match?(%Tx{}, tx_or_repo), do: Schema.ensure!(repo)
     id = Ecto.UUID.generate()
@@ -206,6 +237,7 @@ defmodule PgTxn do
   """
   @spec enqueue(tx | repo, String.t() | atom, term, keyword) :: String.t()
   def enqueue(tx_or_repo, name, input \\ %{}, opts \\ []) do
+    with %Tx{} = tx <- tx_or_repo, do: Tx.check!(tx)
     repo = repo!(tx_or_repo)
     unless match?(%Tx{}, tx_or_repo), do: Schema.ensure!(repo)
 

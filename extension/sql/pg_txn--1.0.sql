@@ -157,7 +157,6 @@ BEGIN
             RAISE EXCEPTION 'pg_txn: transaction % is % and driven by another process', p_tx, t.status
                 USING ERRCODE = 'lock_not_available', DETAIL = 'fenced';
         END IF;
-        UPDATE txn.transactions SET runs = runs + 1, updated_at = txn._now() WHERE id = p_tx;
     END IF;
 END $$;
 
@@ -212,7 +211,10 @@ END $$;
 -- but not used by this run are orphaned (their compensations are scheduled)
 -- and the outcome is stored (releasing its keys), atomically with the run's
 -- own writes.
-CREATE FUNCTION txn.finish(p_tx uuid, p_owner uuid, p_consumed uuid[], p_output jsonb DEFAULT NULL)
+-- p_runs: how many runs this process made (runs are rolled back, so they
+-- cannot count themselves).
+CREATE FUNCTION txn.finish(p_tx uuid, p_owner uuid, p_consumed uuid[], p_output jsonb DEFAULT NULL,
+                           p_runs integer DEFAULT 1)
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE
     t txn.transactions;
@@ -229,7 +231,7 @@ BEGIN
     n := txn._orphan(p_tx, p_consumed, NULL);
     DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
-       SET status = 'committed', output = p_output, owner = NULL, lease_until = NULL,
+       SET status = 'committed', output = p_output, owner = NULL, lease_until = NULL, runs = runs + p_runs,
            updated_at = txn._now(), finished_at = txn._now()
      WHERE id = p_tx;
     PERFORM pg_catalog.pg_notify('txn_done', p_tx::text);
@@ -402,7 +404,7 @@ $$;
 
 -- The transaction failed (the function threw): its effects are orphaned and
 -- compensated.
-CREATE FUNCTION txn.fail_transaction(p_tx uuid, p_owner uuid, p_error jsonb) RETURNS boolean
+CREATE FUNCTION txn.fail_transaction(p_tx uuid, p_owner uuid, p_error jsonb, p_runs integer DEFAULT 1) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM 1 FROM txn.transactions WHERE id = p_tx AND owner = p_owner AND status = 'running' FOR UPDATE;
@@ -412,7 +414,7 @@ BEGIN
     PERFORM txn._orphan(p_tx, '{}', NULL);
     DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
-       SET status = 'failed', error = p_error, owner = NULL, lease_until = NULL,
+       SET status = 'failed', error = p_error, owner = NULL, lease_until = NULL, runs = runs + p_runs,
            updated_at = txn._now(), finished_at = txn._now()
      WHERE id = p_tx;
     PERFORM pg_catalog.pg_notify('txn_done', p_tx::text);

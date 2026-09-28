@@ -44,6 +44,8 @@ defmodule PgTxn.Loop do
       lease_ms: lease_ms,
       named: Keyword.get(opts, :named, false),
       repo_opts: Keyword.drop(opts, @own_opts),
+      # every run is rolled back but the last, so the count is kept here
+      runs: 0,
       started_at: DateTime.truncate(started_at, :millisecond)
     }
 
@@ -135,6 +137,7 @@ defmodule PgTxn.Loop do
   end
 
   defp loop(ctx, fun, retries) do
+    ctx = %{ctx | runs: ctx.runs + 1}
     tx = Tx.new(ctx.repo, ctx.tx_id, ctx.owner, ctx.started_at)
 
     outcome =
@@ -162,8 +165,8 @@ defmodule PgTxn.Loop do
     state = Tx.state(tx)
     if state.needs != [], do: ctx.repo.rollback(NeedEffect)
 
-    SQL.all(ctx.repo, "SELECT txn.finish($1::text::uuid, $2::text::uuid, $3::text[]::uuid[], $4::text::jsonb)",
-      [ctx.tx_id, ctx.owner, state.consumed, output(result, ctx.named)])
+    SQL.all(ctx.repo, "SELECT txn.finish($1::text::uuid, $2::text::uuid, $3::text[]::uuid[], $4::text::jsonb, $5)",
+      [ctx.tx_id, ctx.owner, state.consumed, output(result, ctx.named), ctx.runs])
 
     result
   end
@@ -204,8 +207,8 @@ defmodule PgTxn.Loop do
   end
 
   defp fail(ctx, error) do
-    SQL.all(ctx.repo, "SELECT txn.fail_transaction($1::text::uuid, $2::text::uuid, $3::text::jsonb)",
-      [ctx.tx_id, ctx.owner, Jason.encode!(error)])
+    SQL.all(ctx.repo, "SELECT txn.fail_transaction($1::text::uuid, $2::text::uuid, $3::text::jsonb, $4)",
+      [ctx.tx_id, ctx.owner, Jason.encode!(error), ctx.runs])
   rescue
     e -> Logger.warning("pg_txn: could not record the failure of #{ctx.tx_id}: #{Exception.message(e)}")
   end

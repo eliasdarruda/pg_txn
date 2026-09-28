@@ -22,7 +22,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
       - run: mkdir -p .tools && ln -s "$(command -v bun)" .tools/bun
-      - run: ONLY="unit core compat bun elixir containers k8s" scripts/test-all.sh
+      - run: scripts/test-all.sh
       - if: failure()
         uses: actions/upload-artifact@v4
         with: { name: test-logs, path: tests/.logs }

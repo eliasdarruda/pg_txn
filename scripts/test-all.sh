@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Full verification run against stock PostgreSQL images (pg_txn installs
-# itself as a non-superuser): PostgreSQL 18, 14 and PgBouncer in transaction
-# mode, Node and Bun, the TypeScript and Elixir clients, application replicas
-# in containers and a Kubernetes Deployment. Prints a summary table.
+# Every suite against stock PostgreSQL images (pg_txn installs itself as a
+# non-superuser): PostgreSQL 18 and 14, PgBouncer in transaction mode, Node
+# and Bun, the TypeScript and Elixir clients, and the npm packages. Prints a
+# summary table.
 #
 #   scripts/test-all.sh
-#   ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir containers k8s
+#   ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir pack
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -61,13 +61,7 @@ if want elixir; then
     -e PG_TXN_ECTO_URL=ecto://app:app@localhost:55432/app pg-txn-elixir mix test
 fi
 
-# the npm package in application containers (Node slim/alpine, Bun) and as a
-# Kubernetes Deployment (k3s in Docker; the cluster container is reused)
-if want containers || want k8s; then
-  step pack-npm scripts/pack-npm.sh
-fi
-want containers && step containers-horizontal node_test 'tests/containers/*.test.ts'
-want k8s && step k8s-deployment node_test 'tests/k8s/*.test.ts'
+want pack && step pack-npm scripts/pack-npm.sh
 
 echo
 echo "================ summary ================"

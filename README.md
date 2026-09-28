@@ -202,14 +202,12 @@ Every replica runs its share of the work, so add or remove replicas freely.
   work finish.
 - **A killed replica:** its named transactions are resumed by the others,
   with the same idempotency keys. Its inline transactions are abandoned and
-  their rows released.
+  their keys released.
 - **Poolers:** everything works behind PgBouncer or RDS Proxy. Set
   `listen: false` so the optional LISTEN connection is not pinned.
 
-This is tested with replicas in containers (Node on Debian and Alpine, and
-Bun) and a Kubernetes Deployment. One replica is SIGKILLed mid-flight while
-others are rolled and scaled. Every transaction commits exactly once. See
-[docs/operations.md](docs/operations.md).
+There is nothing else to deploy: every replica is just your application.
+See [docs/operations.md](docs/operations.md).
 
 ## Observability
 
@@ -257,6 +255,11 @@ while it runs.
   `tx.effect` or `tx.spawn`; anything else repeats on every run.
 - **Keys are cooperative,** like advisory locks: they order pg_txn
   transactions that use them. Plain SQL writes are not blocked.
+- **Not inside another database transaction.** `pgtxn.transaction` runs on
+  its own connections: it commits independently of a transaction around it,
+  and would wait forever on rows that transaction has locked. From inside
+  your own transaction, use `pgtxn.spawn(fn, { trx })` or
+  `pgtxn.enqueue(name, input, { trx })`, which take effect iff it commits.
 - **Crash recovery needs a name.** `define`/`enqueue` transactions resume on
   another replica. An inline `transaction(fn)` is abandoned (its keys are
   released) if its process dies.
@@ -284,14 +287,15 @@ while it runs.
 docker compose --profile matrix up -d     # PostgreSQL 18 and 14, PgBouncer
 npm install
 scripts/test-all.sh                       # every suite, with a summary
-ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir containers k8s
+ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir pack
 ```
 
 ```
 extension/sql/          the schema: the database side of pg_txn
 clients/typescript/     @pg-txn/client, @pg-txn/drizzle, @pg-txn/knex
 clients/elixir/         PgTxn, PgTxn.Repo, PgTxn.Multi
-tests/                  core suites, containers, Kubernetes, benchmark
+tests/core/             transactions, spawns, concurrency and keys, composition, crash recovery
+tests/performance/      benchmark
 docs/                   protocol, operations
 ```
 

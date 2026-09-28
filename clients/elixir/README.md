@@ -64,12 +64,16 @@ committed and completed effects are compensated.
 |---|---|---|
 | `:key` | none | transactions with the same key run one at a time; the others wait, holding nothing |
 | `:keys` | none | several keys, claimed all at once or none (no deadlocks), e.g. `keys: [{"account", from}, {"account", to}]` |
-| `:id` | a new uuid | the transaction id |
+| `:id` | a new uuid | the transaction id; idempotent: an id that already exists is not run again, its outcome is returned (`{:ok, output}`, or `{:error, %PgTxn.TransactionFailedError{}}`) |
 
 A key is a string, used as is, or any JSON-able term: `{"order", 42}` and
 `["order", 42]` are both stored as `["order",42]`, the same key as in the
 other clients. A transaction that waits longer than `:key_wait_ms` raises
 `PgTxn.KeyTimeoutError`. Other options go to `Repo.transaction/2`.
+
+Use `tx` only in the transaction function, in the process running it. Using it
+inside an effect's or a spawned function, or after the transaction ended,
+raises an `ArgumentError`.
 
 ### `PgTxn.effect(tx, fun, opts)`
 

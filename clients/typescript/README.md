@@ -87,7 +87,7 @@ Runs `fn(tx)` as one transaction that may include effects, and returns what
 |---|---|
 | `key` | transactions with the same key run one at a time; the others wait, holding nothing. A string, or JSON such as `["order", id]`. |
 | `keys` | several keys, claimed all at once or none (no deadlocks), e.g. `[["account", from], ["account", to]]` |
-| `id` | the transaction id |
+| `id` | the transaction id. Idempotent: an id that already ended returns its recorded output (or throws its error) without running `fn` again, so a retried request is safe. |
 | `isolation` | e.g. `"serializable"` |
 
 Without a key, concurrency is optimistic. Every run re-reads your data, so

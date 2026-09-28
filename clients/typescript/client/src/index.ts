@@ -13,6 +13,7 @@
 // called outside of any transaction, its result is recorded, and your function
 // runs again: effects that already ran return their recorded results. The run
 // that reaches the end commits everything at once. See docs/protocol.md.
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { type Db, type TransactionOptions, isPgPool, pgDb } from "./db.ts";
 import {
@@ -150,6 +151,9 @@ type Need = { seq: number; name: string; tagged: unknown; fn: (ctx: EffectContex
 type Local = { fn: (ctx: EffectContext, input: any) => unknown; timeoutMs?: number; since: number; txId: string | null; compensation: boolean };
 type Action = { seq: number; id: string; action: "execute" | "wait" | "done"; attempt: number; wait_ms: number };
 
+// set while an effect's or a spawned function runs: tx must not be used there
+const inEffect = new AsyncLocalStorage<boolean>();
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const json = (v: unknown) => JSON.stringify(toTagged(v === undefined ? null : v));
 
@@ -176,10 +180,11 @@ class Run<T> implements Tx<T> {
   consumed: string[] = [];
   spawned: string[] = [];
   closed = false;
+  ended = false;
   #inflight = 0;
   #idle: (() => void)[] = [];
   #uuids = 0;
-  db!: T;
+  #db!: T;
   readonly id: string;
   private core: PgTxn;
   private startedAt: Date;
@@ -190,11 +195,28 @@ class Run<T> implements Tx<T> {
     this.startedAt = startedAt;
   }
 
+  get db(): T {
+    this.#check();
+    return this.#db;
+  }
+
+  set db(trx: T) {
+    this.#db = trx;
+  }
+
+  #check(): void {
+    if (inEffect.getStore()) {
+      throw new Error("pg_txn: tx cannot be used inside an effect's or a spawned function: it runs outside the transaction. Return what you need from the effect and use it after");
+    }
+    if (this.ended) throw new Error("pg_txn: this transaction has ended; tx cannot be used after it");
+  }
+
   async #q(text: string, params: unknown[]) {
+    this.#check();
     if (this.closed) throw new NeedEffect();
     this.#inflight++;
     try {
-      return await this.core.db.query(this.db, text, params);
+      return await this.core.db.query(this.#db, text, params);
     } finally {
       if (--this.#inflight === 0) for (const r of this.#idle.splice(0)) r();
     }
@@ -237,10 +259,12 @@ class Run<T> implements Tx<T> {
   }
 
   now(): Date {
+    this.#check();
     return new Date(this.startedAt);
   }
 
   uuid(): string {
+    this.#check();
     return stableUuid(`${this.id}:${this.#uuids++}`);
   }
 }
@@ -334,10 +358,17 @@ export class PgTxn<T = any> {
 
   /**
    * Runs fn as one transaction that may include effects. With a key,
-   * transactions with the same key run one at a time.
+   * transactions with the same key run one at a time. With an id, it is
+   * idempotent: an id that already ended returns its recorded output (or
+   * throws its error) without running fn again.
    */
   async transaction<R>(fn: (tx: Tx<T>) => Promise<R> | R, options: RunOptions = {}): Promise<R> {
     await this.ready();
+    if (options.id !== undefined) {
+      // idempotent by id: a transaction that already ended is not run again
+      const done = await this.#ended<R>(options.id);
+      if (done) return done.output;
+    }
     const id = options.id ?? randomUUID();
     if (!keysOf(options)) return this.#drive(id, (tx) => fn(tx), new Date(), options);
     const startedAt = await this.#start(id, null, null, options);
@@ -396,6 +427,15 @@ export class PgTxn<T = any> {
     return id;
   }
 
+  // The outcome of a transaction that ended (its output, or its error thrown),
+  // after waiting for it if another process is running it; null if unknown.
+  async #ended<R>(id: string): Promise<{ output: R } | null> {
+    const r = (await this.db.query(null, "SELECT status, owner FROM txn.transactions WHERE id = $1", [id])).rows[0];
+    if (!r) return null;
+    if (r.status === "running" && r.owner === this.owner) return null;
+    return { output: await this.wait<R>(id, this.#opts.keyWaitMs) };
+  }
+
   /** Waits for a transaction (e.g. an enqueued one) and returns its output. */
   async wait<R = unknown>(txId: string, timeoutMs = 60_000): Promise<R> {
     const deadline = Date.now() + timeoutMs;
@@ -438,18 +478,21 @@ export class PgTxn<T = any> {
 
   async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
     let retries = 0;
+    let runs = 0;
     for (;;) {
       const run = new Run<T>(this, txId, startedAt);
+      runs++;
       try {
         const out = await this.db.transaction(async (trx) => {
           run.db = trx;
           await this.db.query(trx, "SELECT txn.attempt($1, $2)", [txId, this.owner]);
           const result = await fn(run);
           if (run.needs.length) throw new NeedEffect();
-          await this.db.query(trx, "SELECT txn.finish($1, $2, $3::uuid[], $4::jsonb)", [txId, this.owner, run.consumed, json(result)]);
+          await this.db.query(trx, "SELECT txn.finish($1, $2, $3::uuid[], $4::jsonb, $5)", [txId, this.owner, run.consumed, json(result), runs]);
           return result;
         }, options);
         run.closed = true;
+        run.ended = true;
         if (run.spawned.length) this.#wake?.();
         return out;
       } catch (e) {
@@ -461,12 +504,14 @@ export class PgTxn<T = any> {
         }
         const state = sqlState(e);
         const detail = sqlDetail(e) ?? "";
+        run.ended = true;
         if (state === "55P03" && detail === "fenced") throw new FencedError(txId);
         if ((state === "40001" || state === "40P01") && retries++ < 100) {
+          run.ended = false;
           await sleep(Math.min(1000, 5 * 2 ** Math.min(retries, 8)) * Math.random());
           continue;
         }
-        await this.db.query(null, "SELECT txn.fail_transaction($1, $2, $3::jsonb)", [txId, this.owner, JSON.stringify(errorJson(e))])
+        await this.db.query(null, "SELECT txn.fail_transaction($1, $2, $3::jsonb, $4)", [txId, this.owner, JSON.stringify(errorJson(e)), runs])
           .catch(() => {});
         throw e;
       }
@@ -525,7 +570,7 @@ export class PgTxn<T = any> {
 
     try {
       const result = await Promise.race([
-        Promise.resolve().then(() => fn({ effectId, idempotencyKey: effectId, attempt, signal: ctrl.signal, txId })),
+        inEffect.run(true, () => Promise.resolve().then(() => fn({ effectId, idempotencyKey: effectId, attempt, signal: ctrl.signal, txId }))),
         timeout,
       ]);
       return { ok: true as const, result, error: null, retryable: false, retryAfterMs: undefined };

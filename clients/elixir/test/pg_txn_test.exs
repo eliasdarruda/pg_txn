@@ -683,4 +683,233 @@ defmodule PgTxnTest do
     assert order(a).amount + order(b).amount == 200
     assert {order(a).amount, order(b).amount} == {100, 100}
   end
+
+  # ------------------------------------------------------------------ composition
+
+  defp runs_of(tx_id), do: scalar("SELECT runs FROM txn.transactions WHERE id = $1::text::uuid", [tx_id])
+
+  defp collect(tag, n, timeout \\ 5_000) do
+    for _ <- 1..n do
+      receive do
+        {^tag, v} -> v
+      after
+        timeout -> flunk("expected #{n} #{inspect(tag)} messages")
+      end
+    end
+  end
+
+  test "composition: spawn with a Repo inside Repo.transaction runs iff it commits" do
+    test = self()
+    {:ok, _} = Repo.transaction(fn -> PgTxn.spawn(Repo, fn -> send(test, {:ran, "committed"}); :ok end) end)
+    {:error, :no} = Repo.transaction(fn -> PgTxn.spawn(Repo, fn -> send(test, {:ran, "rolled back"}); :ok end); Repo.rollback(:no) end)
+    assert collect(:ran, 1) == ["committed"]
+    refute_receive {:ran, _}, 300
+  end
+
+  test "composition: a spawn after a savepoint that is rolled back does not run, though the transaction commits" do
+    test = self()
+
+    {:ok, _} =
+      Repo.transaction(fn ->
+        PgTxn.spawn(Repo, fn -> send(test, {:ran, "kept"}); :ok end)
+        Repo.query!("SAVEPOINT s")
+        PgTxn.spawn(Repo, fn -> send(test, {:ran, "undone"}); :ok end)
+        Repo.query!("ROLLBACK TO SAVEPOINT s")
+      end)
+
+    assert collect(:ran, 1) == ["kept"]
+    refute_receive {:ran, _}, 300
+  end
+
+  test "composition: enqueue inside Repo.transaction is queued iff it commits" do
+    PgTxn.define(Repo, "compose_enqueue", fn _tx, %{"id" => id} ->
+      Repo.query!("UPDATE orders SET status = 'done' WHERE id = $1", [id])
+      id
+    end)
+
+    a = insert_order()
+    b = insert_order()
+    {:ok, kept} = Repo.transaction(fn -> PgTxn.enqueue(Repo, "compose_enqueue", %{id: a}) end)
+    {:error, {:dropped, dropped}} = Repo.transaction(fn -> Repo.rollback({:dropped, PgTxn.enqueue(Repo, "compose_enqueue", %{id: b})}) end)
+    assert {:ok, ^a} = PgTxn.wait(Repo, kept, 10_000)
+    assert order(a).status == "done"
+    assert scalar("SELECT count(*) FROM txn.transactions WHERE id = $1::text::uuid", [dropped]) == 0
+    assert order(b).status == "new"
+  end
+
+  test "composition: PgTxn.transaction inside Repo.transaction is refused" do
+    assert_raise ArgumentError, ~r/cannot run inside another Repo transaction/, fn ->
+      Repo.transaction(fn -> PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> 1 end) end) end)
+    end
+  end
+
+  test "composition: 10 spawns run once each, after the commit, each seeing it, with distinct idempotency keys" do
+    test = self()
+    id = insert_order()
+
+    {:ok, _} =
+      PgTxn.transaction(Repo, fn tx ->
+        Repo.query!("UPDATE orders SET status = 'paid' WHERE id = $1", [id])
+        for n <- 0..9, do: PgTxn.spawn(tx, fn ctx -> send(test, {:seen, {n, ctx.idempotency_key, order(id).status}}); :ok end)
+      end)
+
+    seen = collect(:seen, 10)
+    refute_receive {:seen, _}, 300
+    assert seen |> Enum.map(&elem(&1, 0)) |> Enum.sort() == Enum.to_list(0..9)
+    assert seen |> Enum.map(&elem(&1, 1)) |> Enum.uniq() |> length() == 10
+    assert Enum.all?(seen, &(elem(&1, 2) == "paid"))
+  end
+
+  test "composition: effects and spawns interleaved over 3 rounds: each once, 4 runs" do
+    test = self()
+    c = counter()
+    tx_id = Ecto.UUID.generate()
+    sp = fn label -> fn -> send(test, {:spawned, label}); :ok end end
+
+    {:ok, _} =
+      PgTxn.transaction(Repo, fn tx ->
+        PgTxn.spawn(tx, sp.("s0"))
+        a = PgTxn.effect(tx, fn -> bump(c, :a); 1 end)
+        PgTxn.spawn(tx, sp.("s1:#{a}"))
+        b = PgTxn.effect(tx, fn -> bump(c, :b); a + 1 end)
+        PgTxn.spawn(tx, sp.("s2:#{b}"))
+        d = PgTxn.effect(tx, fn -> bump(c, :c); b + 1 end)
+        PgTxn.spawn(tx, sp.("s3:#{d}"))
+      end, id: tx_id)
+
+    assert {count(c, :a), count(c, :b), count(c, :c)} == {1, 1, 1}
+    assert runs_of(tx_id) == 4
+    assert Enum.sort(collect(:spawned, 4)) == ["s0", "s1:1", "s2:2", "s3:3"]
+    refute_receive {:spawned, _}, 300
+  end
+
+  test "composition: an effect's result decides the spawns, one per item" do
+    test = self()
+
+    {:ok, _} =
+      PgTxn.transaction(Repo, fn tx ->
+        for r <- PgTxn.effect(tx, fn -> ["ana", "bo", "cy"] end), do: PgTxn.spawn(tx, fn -> send(test, {:sent, r}); :ok end)
+        PgTxn.effect(tx, fn -> "audit" end)
+      end)
+
+    assert Enum.sort(collect(:sent, 3)) == ["ana", "bo", "cy"]
+    refute_receive {:sent, _}, 300
+  end
+
+  # effects are sequential in Elixir (the run's state lives in the process
+  # running it), so only the sequential half of the TS test applies
+  test "composition: a data-dependent number of sequential effects takes N+1 runs" do
+    c = counter()
+    tx_id = Ecto.UUID.generate()
+
+    {:ok, 150} =
+      PgTxn.transaction(Repo, fn tx ->
+        Enum.sum(for i <- 1..5, do: PgTxn.effect(tx, fn -> bump(c, :calls); i * 10 end))
+      end, id: tx_id)
+
+    assert count(c, :calls) == 5
+    assert runs_of(tx_id) == 6
+  end
+
+  test "composition: one spawn failing permanently does not affect the others or the commit" do
+    test = self()
+    id = insert_order()
+
+    {:ok, bad} =
+      PgTxn.transaction(Repo, fn tx ->
+        Repo.query!("UPDATE orders SET status = 'paid' WHERE id = $1", [id])
+        PgTxn.spawn(tx, fn -> send(test, {:ran, "a"}); :ok end)
+        bad = PgTxn.spawn(tx, fn -> raise PgTxn.PermanentError, "mail server said no" end)
+        PgTxn.spawn(tx, fn -> send(test, {:ran, "c"}); :ok end)
+        bad
+      end)
+
+    assert order(id).status == "paid"
+    assert Enum.sort(collect(:ran, 2)) == ["a", "c"]
+    wait_until(fn -> scalar("SELECT status FROM txn.effects WHERE id = $1::text::uuid", [bad]) == "failed" end)
+    assert scalar("SELECT error->>'message' FROM txn.effects WHERE id = $1::text::uuid", [bad]) == "mail server said no"
+  end
+
+  test "composition: a failure after 3 compensated effects and 3 spawns: 3 compensations, no spawn" do
+    test = self()
+    tx_id = Ecto.UUID.generate()
+
+    assert_raise RuntimeError, "out of stock", fn ->
+      PgTxn.transaction(Repo, fn tx ->
+        for name <- ["charge", "reserve", "notify-partner"] do
+          PgTxn.effect(tx, fn -> name end, name: name, compensate: fn r -> send(test, {:undone, r}); :ok end)
+          PgTxn.spawn(tx, fn -> send(test, {:spawned, name}); :ok end)
+        end
+
+        raise "out of stock"
+      end, id: tx_id)
+    end
+
+    assert Enum.sort(collect(:undone, 3)) == ["charge", "notify-partner", "reserve"]
+    refute_receive {:undone, _}, 300
+    refute_received {:spawned, _}
+    assert runs_of(tx_id) == 4
+  end
+
+  test "ids: an id that already committed returns its recorded output without running again" do
+    c = counter()
+    id = Ecto.UUID.generate()
+    f = fn tx -> PgTxn.effect(tx, fn -> bump(c, :calls) end); bump(c, :fun); "receipt-7" end
+    assert {:ok, "receipt-7"} = PgTxn.transaction(Repo, f, id: id)
+    fun_calls = count(c, :fun)
+    assert {:ok, "receipt-7"} = PgTxn.transaction(Repo, f, id: id)
+    assert count(c, :calls) == 1
+    assert count(c, :fun) == fun_calls
+  end
+
+  test "ids: an id that already failed returns its recorded error without running again" do
+    c = counter()
+    id = Ecto.UUID.generate()
+    f = fn tx -> bump(c, :fun); PgTxn.effect(tx, fn -> 1 end); raise "nope" end
+    assert_raise RuntimeError, "nope", fn -> PgTxn.transaction(Repo, f, id: id) end
+    before = count(c, :fun)
+
+    assert {:error, %PgTxn.TransactionFailedError{status: "failed", error: %{"message" => "nope"}}} =
+             PgTxn.transaction(Repo, f, id: id)
+
+    assert count(c, :fun) == before
+  end
+
+  test "misuse: tx inside an effect's or a spawned function is refused with a clear error" do
+    test = self()
+
+    {:ok, _} =
+      PgTxn.transaction(Repo, fn tx ->
+        PgTxn.effect(tx, fn ->
+          try do
+            PgTxn.effect(tx, fn -> 1 end)
+          rescue
+            e -> send(test, {:error, Exception.message(e)})
+          end
+
+          :ok
+        end)
+
+        PgTxn.spawn(tx, fn ->
+          try do
+            PgTxn.uuid(tx)
+          rescue
+            e -> send(test, {:error, Exception.message(e)})
+          end
+
+          :ok
+        end)
+      end)
+
+    assert [a, b] = collect(:error, 2)
+    assert a =~ "cannot be used inside an effect"
+    assert b =~ "cannot be used inside an effect"
+  end
+
+  test "misuse: tx after its transaction ended is refused with a clear error" do
+    {:ok, leaked} = PgTxn.transaction(Repo, fn tx -> tx end)
+    assert_raise ArgumentError, ~r/has ended/, fn -> PgTxn.effect(leaked, fn -> 1 end) end
+    assert_raise ArgumentError, ~r/has ended/, fn -> PgTxn.spawn(leaked, fn -> 1 end) end
+    assert_raise ArgumentError, ~r/has ended/, fn -> PgTxn.now(leaked) end
+  end
 end

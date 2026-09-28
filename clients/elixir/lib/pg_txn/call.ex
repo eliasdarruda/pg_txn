@@ -21,7 +21,11 @@ defmodule PgTxn.Call do
   def call(thunk, opts) do
     timeout = Keyword.get(opts, :timeout_ms, 30_000)
     retry = Keyword.get(opts, :retry, false)
-    task = Task.async(fn -> invoke(thunk) end)
+    task =
+      Task.async(fn ->
+        Process.put(in_effect_key(), true)
+        invoke(thunk)
+      end)
 
     reply =
       case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
@@ -32,6 +36,9 @@ defmodule PgTxn.Call do
 
     classify(reply, retry)
   end
+
+  @doc "Set in the process running an effect, spawned or compensation function."
+  def in_effect_key, do: {__MODULE__, :in_effect}
 
   defp invoke(thunk) do
     case thunk.() do
