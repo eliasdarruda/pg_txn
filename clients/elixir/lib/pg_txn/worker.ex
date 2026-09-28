@@ -1,0 +1,330 @@
+defmodule PgTxn.Worker do
+  @moduledoc """
+  This node's pg_txn worker for a Repo: runs this node's spawned effects
+  and compensations (functions kept in its memory, see `PgTxn.spawn/3`), and
+  drives named transactions that nobody drives (enqueued ones, and ones
+  whose process stopped).
+
+  Started by `use PgTxn.Repo`, or directly:
+
+      children = [MyApp.Repo, {PgTxn.Worker, repo: MyApp.Repo}]
+
+  It installs the `txn` schema on start, polls (woken early by
+  `LISTEN txn_effects` and by this node's own spawns), reports itself with
+  `txn.worker_seen` every 10 s, every 5 s abandons inline transactions
+  whose process stopped, expires the leases of spawned effects whose worker
+  stopped, fails those whose node is gone (`EffectLost`) and forgets
+  functions that no effect needs anymore, and heartbeats the leases of the
+  work it runs. On shutdown it stops leasing and waits up to `:drain_ms` for
+  work in progress. See `PgTxn.Config` for the options.
+  """
+  use GenServer
+  require Logger
+  alias PgTxn.{Call, Config, DJSON, FencedError, Local, Loop, Registry, Schema, SQL}
+
+  @seen_every 10_000
+  @maintain_every 5_000
+  @forget_after 30_000
+
+  @doc false
+  def child_spec(opts) do
+    repo = Keyword.fetch!(opts, :repo)
+
+    %{
+      id: {__MODULE__, repo},
+      start: {__MODULE__, :start_link, [opts]},
+      # draining happens in terminate/2
+      shutdown: Config.get(repo, :drain_ms) + 5_000
+    }
+  end
+
+  @doc "Starts the worker of `opts[:repo]`."
+  def start_link(opts) do
+    repo = Keyword.fetch!(opts, :repo)
+    GenServer.start_link(__MODULE__, repo, name: name(repo))
+  end
+
+  @doc "The registered name of a Repo's worker."
+  def name(repo), do: Module.concat(repo, PgTxnWorker)
+
+  @doc "Makes the Repo's worker (if running on this node) poll now."
+  @spec wake(module) :: :ok
+  def wake(repo) do
+    case Process.whereis(name(repo)) do
+      nil -> :ok
+      pid -> send(pid, :wake)
+    end
+
+    :ok
+  end
+
+  # ------------------------------------------------------------------ server
+
+  @impl true
+  def init(repo) do
+    Process.flag(:trap_exit, true)
+    Local.new(repo)
+
+    state = %{
+      repo: repo,
+      owner: Config.owner(repo),
+      opts: Config.get(repo),
+      tasks: %{},
+      timer: nil,
+      ready: false,
+      listener: nil,
+      last_seen: nil,
+      last_maintain: nil
+    }
+
+    {:ok, state, {:continue, :start}}
+  end
+
+  @impl true
+  def handle_continue(:start, state), do: {:noreply, start(state)}
+
+  @impl true
+  def handle_info(:start, state), do: {:noreply, start(state)}
+
+  def handle_info(msg, %{ready: true} = state) when msg in [:poll, :wake] do
+    if state.timer, do: Process.cancel_timer(state.timer)
+    {found, state} = poll(state)
+    delay = if found > 0, do: 0, else: state.opts[:poll_ms]
+    {:noreply, %{state | timer: Process.send_after(self(), :poll, delay)}}
+  end
+
+  def handle_info({:notification, _pid, _ref, _channel, _payload}, state) do
+    send(self(), :wake)
+    {:noreply, state}
+  end
+
+  def handle_info({ref, _result}, state) when is_map_key(state.tasks, ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | tasks: Map.delete(state.tasks, ref)}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) when is_map_key(state.tasks, ref) do
+    Logger.error("pg_txn worker: #{inspect(state.tasks[ref])} crashed: #{inspect(reason)}")
+    {:noreply, %{state | tasks: Map.delete(state.tasks, ref)}}
+  end
+
+  def handle_info({:EXIT, pid, reason}, %{listener: pid} = state) do
+    Logger.warning("pg_txn worker: LISTEN connection stopped (#{inspect(reason)}); polling only")
+    {:noreply, %{state | listener: nil}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    if state.timer, do: Process.cancel_timer(state.timer)
+    deadline = System.monotonic_time(:millisecond) + state.opts[:drain_ms]
+    drain(state.tasks, deadline)
+  end
+
+  defp drain(tasks, _deadline) when map_size(tasks) == 0, do: :ok
+
+  defp drain(tasks, deadline) do
+    left = max(0, deadline - System.monotonic_time(:millisecond))
+
+    receive do
+      {ref, _} when is_map_key(tasks, ref) -> drain(Map.delete(tasks, ref), deadline)
+      {:DOWN, ref, :process, _, _} when is_map_key(tasks, ref) -> drain(Map.delete(tasks, ref), deadline)
+    after
+      left -> Logger.warning("pg_txn worker: #{map_size(tasks)} task(s) still running after drain_ms")
+    end
+  end
+
+  defp start(state) do
+    Schema.ensure!(state.repo)
+    send(self(), :poll)
+    %{state | ready: true, listener: listen(state)}
+  rescue
+    e ->
+      Logger.error("pg_txn worker: cannot start for #{inspect(state.repo)}: #{Exception.message(e)}; retrying")
+      Process.send_after(self(), :start, 1_000)
+      state
+  end
+
+  defp listen(%{opts: opts, repo: repo}) do
+    if opts[:listen] do
+      config = repo.config() |> Keyword.drop([:pool, :pool_size, :name]) |> Keyword.put(:auto_reconnect, true)
+
+      with {:ok, pid} <- Postgrex.Notifications.start_link(config),
+           {:ok, _ref} <- Postgrex.Notifications.listen(pid, "txn_effects") do
+        pid
+      else
+        _ -> nil
+      end
+    end
+  end
+
+  # ------------------------------------------------------------------ polling
+
+  defp poll(state) do
+    state = housekeeping(state)
+    {n1, state} = lease_effects(state)
+    {n2, state} = lease_transactions(state)
+    {n1 + n2, state}
+  rescue
+    e ->
+      Logger.error("pg_txn worker: #{Exception.message(e)}")
+      {0, state}
+  end
+
+  defp housekeeping(state) do
+    now = System.monotonic_time(:millisecond)
+
+    state =
+      if due?(state.last_seen, now, @seen_every) do
+        info = %{runtime: "elixir", node: to_string(node()), pid: System.pid(), defines: Map.keys(Registry.definitions(state.repo))}
+        SQL.all(state.repo, "SELECT txn.worker_seen($1::text::uuid, $2::text::jsonb)", [state.owner, Jason.encode!(info)])
+
+        # the owners of transactions this node drove (or drives): their
+        # compensations are this node's to run
+        for owner <- Local.compensation_owners(state.repo), owner != state.owner do
+          SQL.all(state.repo, "SELECT txn.worker_seen($1::text::uuid, $2::text::jsonb)",
+            [owner, Jason.encode!(%{runtime: "elixir", node: to_string(node()), worker: state.owner})])
+        end
+
+        %{state | last_seen: now}
+      else
+        state
+      end
+
+    if due?(state.last_maintain, now, @maintain_every) do
+      SQL.all(state.repo, "SELECT txn.abandon_expired(), txn.expire_effect_leases(), txn.fail_lost_effects()")
+      forget(state.repo)
+      %{state | last_maintain: now}
+    else
+      state
+    end
+  end
+
+  # forgets functions whose effect is finished or was never committed
+  defp forget(repo) do
+    case Local.older_than(repo, @forget_after) do
+      [] ->
+        :ok
+
+      old ->
+        live =
+          repo
+          |> SQL.all("""
+          SELECT coalesce(compensates, id)::text AS id FROM txn.effects
+           WHERE (id = ANY ($1::text[]::uuid[]) OR compensates = ANY ($1::text[]::uuid[])) AND kind <> 'call'
+             AND status IN ('pending', 'retry_wait', 'running')
+          """, [old])
+          |> MapSet.new(& &1["id"])
+
+        Local.delete(repo, Enum.reject(old, &MapSet.member?(live, &1)))
+    end
+  end
+
+  defp due?(nil, _now, _every), do: true
+  defp due?(last, now, every), do: now - last > every
+
+  defp free(state), do: state.opts[:concurrency] - map_size(state.tasks)
+
+  defp lease_effects(state) do
+    if Local.any?(state.repo) do
+      owners = Enum.uniq([state.owner | Local.compensation_owners(state.repo)])
+      Enum.reduce(owners, {0, state}, fn owner, {n, st} -> lease_effects(st, owner, n) end)
+    else
+      {0, state}
+    end
+  end
+
+  defp lease_effects(state, owner, n) do
+    if free(state) > 0 do
+      rows =
+        SQL.all(state.repo,
+          "SELECT id::text AS id, kind, name, input, attempt, generation, tx_id::text AS tx_id, delivery, compensates::text AS compensates FROM txn.lease_effects($1::text::uuid, $2, $3)",
+          [owner, free(state), state.opts[:lease_ms]])
+
+      state = Enum.reduce(rows, state, fn e, st -> start_task(st, {:effect, e["name"], e["id"]}, fn -> run_local(st, owner, e) end) end)
+      {n + length(rows), state}
+    else
+      {n, state}
+    end
+  end
+
+  defp lease_transactions(state) do
+    definitions = Registry.definitions(state.repo)
+
+    if map_size(definitions) > 0 and free(state) > 0 do
+      # a fresh owner per lease: each driving process has its own lease, so
+      # one that dies is resumed (by this node too) once its lease expires
+      owner = Ecto.UUID.generate()
+
+      rows =
+        SQL.all(state.repo,
+          "SELECT id::text AS id, name, input, created_at FROM txn.lease_transactions($1::text::uuid, $2::text[], $3, $4)",
+          [owner, Map.keys(definitions), free(state), state.opts[:lease_ms]])
+
+      state =
+        Enum.reduce(rows, state, fn t, st ->
+          start_task(st, {:transaction, t["name"], t["id"]}, fn -> drive(st, owner, definitions[t["name"]], t) end)
+        end)
+
+      {length(rows), state}
+    else
+      {0, state}
+    end
+  end
+
+  defp start_task(state, what, fun) do
+    %Task{ref: ref} = Task.async(fun)
+    %{state | tasks: Map.put(state.tasks, ref, what)}
+  end
+
+  # ------------------------------------------------------------------ work
+
+  defp run_local(state, owner, e) do
+    repo = state.repo
+    key = if e["kind"] == "compensation", do: e["compensates"], else: e["id"]
+
+    case Local.get(repo, key) do
+      nil ->
+        SQL.all(repo, "SELECT txn.fail_effect($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb, false)",
+          [e["id"], owner, e["generation"],
+           Jason.encode!(%{name: "EffectLost", message: "this node no longer has the effect's function"})])
+
+      local ->
+        lease_ms = state.opts[:lease_ms]
+
+        heartbeat =
+          Loop.every(max(1000, div(lease_ms, 3)), fn ->
+            SQL.all(repo, "SELECT txn.heartbeat_effect($1::text::uuid, $2::text::uuid, $3, $4)", [e["id"], owner, e["generation"], lease_ms])
+          end)
+
+        try do
+          ctx = %{effect_id: e["id"], idempotency_key: e["id"], attempt: e["attempt"], tx_id: e["tx_id"]}
+          o = Call.call(fn -> local.fun.(ctx, e["input"]) end, retry: e["delivery"] == "at-least-once", timeout_ms: local.timeout_ms || 30_000)
+
+          status =
+            if o.ok do
+              SQL.all(repo, "SELECT txn.complete_effect($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb)",
+                [e["id"], owner, e["generation"], Jason.encode!(o.result)])
+
+              "succeeded"
+            else
+              SQL.value(repo, "SELECT txn.fail_effect($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb, $5, $6)",
+                [e["id"], owner, e["generation"], Jason.encode!(o.error), o.retryable, o.retry_after_ms])
+            end
+
+          if status not in ["retry_wait", "stale"], do: Local.delete(repo, [key])
+        after
+          Task.shutdown(heartbeat, :brutal_kill)
+        end
+    end
+  end
+
+  defp drive(state, owner, fun, t) do
+    input = DJSON.from_tagged(t["input"])
+    Loop.drive(state.repo, t["id"], fn tx -> fun.(tx, input) end, t["created_at"], named: true, owner: owner)
+  rescue
+    FencedError -> :fenced
+    e -> Logger.error("pg_txn worker: transaction #{t["name"]} #{t["id"]} failed: #{Exception.message(e)}")
+  end
+end

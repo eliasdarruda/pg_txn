@@ -1,0 +1,37 @@
+# Test databases: stock PostgreSQL images. pg_txn is plain SQL, installed by
+# the SDKs on first use as the non-superuser role "app" (docker/test-initdb).
+x-pg: &pg
+  environment:
+    POSTGRES_PASSWORD: postgres
+  volumes: ["./docker/test-initdb:/docker-entrypoint-initdb.d:ro"]
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "app", "-d", "app"]
+    interval: 1s
+    retries: 60
+
+services:
+  pg18:
+    <<: *pg
+    image: postgres:18
+    ports: ["55432:5432"]
+
+  # oldest supported version
+  pg14:
+    <<: *pg
+    image: postgres:14
+    ports: ["55433:5432"]
+    profiles: ["matrix"]
+
+  # a transaction-mode pooler in front of pg18 (as RDS Proxy, Supabase, Neon)
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: postgres://app:app@pg18:5432/app
+      POOL_MODE: transaction
+      AUTH_TYPE: plain
+      MAX_CLIENT_CONN: "500"
+      DEFAULT_POOL_SIZE: "10"
+    depends_on:
+      pg18: { condition: service_healthy }
+    ports: ["55434:5432"]
+    profiles: ["matrix"]

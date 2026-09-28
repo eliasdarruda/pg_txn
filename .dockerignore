@@ -1,0 +1,6 @@
+**/node_modules
+.tools
+dist
+tests/.logs
+clients/elixir/_build
+clients/elixir/deps

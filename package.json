@@ -1,0 +1,21 @@
+{
+  "name": "pg-txn-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "clients/typescript/client",
+    "clients/typescript/drizzle",
+    "clients/typescript/knex",
+    "tests"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "sync-schema": "node scripts/sync-schema.mjs",
+    "test": "scripts/test-all.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "@types/pg": "^8.23.1",
+    "typescript": "^5.9.3"
+  }
+}

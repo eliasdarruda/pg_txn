@@ -1,0 +1,11 @@
+# The same application on Bun, installed with bun from the npm package.
+ARG BASE=oven/bun:1-alpine
+FROM ${BASE}
+WORKDIR /app
+COPY pkgs /pkgs
+RUN echo '{"name":"app","private":true,"type":"module"}' > package.json \
+ && bun add /pkgs/pg-txn-client-*.tgz pg@8 \
+ && rm -rf /pkgs
+COPY app.ts app.ts
+USER bun
+CMD ["bun", "app.ts"]

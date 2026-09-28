@@ -1,0 +1,46 @@
+# Tests pg_txn on stock PostgreSQL images and publishes the npm packages
+# (@pg-txn/client, @pg-txn/drizzle, @pg-txn/knex) and the Hex package (pg_txn)
+# on version tags (v*).
+name: release
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
+      - run: mkdir -p .tools && ln -s "$(command -v bun)" .tools/bun
+      - run: ONLY="unit core compat bun elixir containers k8s" scripts/test-all.sh
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: test-logs, path: tests/.logs }
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, registry-url: "https://registry.npmjs.org" }
+      - run: npm ci && scripts/pack-npm.sh
+      - run: for f in dist/npm/*.tgz; do npm publish --provenance --access public "$f"; done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - uses: erlef/setup-beam@v1
+        with: { elixir-version: "1.17", otp-version: "27" }
+      - run: cd clients/elixir && mix deps.get && mix hex.publish --yes
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

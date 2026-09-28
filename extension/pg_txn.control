@@ -1,0 +1,7 @@
+# pg_txn: transactions that include side effects (pure SQL, no library)
+comment = 'Transactions that include side effects: in-transaction effects, lock-free row ownership, built-in outbox'
+default_version = '1.0'
+relocatable = false
+schema = txn
+superuser = false
+trusted = true

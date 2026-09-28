@@ -1,0 +1,12 @@
+{
+  "name": "@pg-txn/tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pg-txn/client": "0.1.0",
+    "@pg-txn/drizzle": "0.1.0",
+    "@pg-txn/knex": "0.1.0",
+    "pg": "^8.13.0"
+  }
+}

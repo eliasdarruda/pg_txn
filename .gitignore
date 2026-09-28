@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.tools/
+tests/.logs/
+clients/elixir/_build/
+clients/elixir/deps/
+__pycache__/
+.omc/
+.claude/

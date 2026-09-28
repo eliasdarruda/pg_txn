@@ -1,0 +1,7 @@
+FROM elixir:1.17-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* \
+ && mix local.hex --force && mix local.rebar --force
+COPY clients/elixir/mix.exs /deps/mix.exs
+RUN cd /deps && mkdir -p lib && MIX_ENV=test mix deps.get && MIX_ENV=test mix deps.compile
+ENV MIX_DEPS_PATH=/deps/deps MIX_BUILD_PATH=/deps/_build/test
+WORKDIR /work/clients/elixir

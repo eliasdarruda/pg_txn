@@ -1,0 +1,37 @@
+# Horizontal scaling in containers (tests/containers/horizontal.test.ts):
+# replicas of an application that each run their share of pg_txn's work, on a
+# stock PostgreSQL where pg_txn installs itself as the non-superuser "app".
+name: pgtxn-containers
+services:
+  postgres:
+    image: ${PG_IMAGE:-postgres:18}
+    environment: { POSTGRES_PASSWORD: postgres }
+    volumes: ["../../docker/test-initdb:/docker-entrypoint-initdb.d:ro"]
+    ports: ["55440:5432"]
+  receiver:
+    image: node:24-slim
+    volumes: ["./receiver.ts:/receiver.ts:ro"]
+    command: ["node", "/receiver.ts"]
+    ports: ["55441:8080"]
+  app:
+    image: pgtxn-containers-app:slim
+    environment: &app-env
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      RECEIVER_URL: http://receiver:8080
+      JOBS: "60"
+      ACTORS: "20"
+    stop_grace_period: 20s
+    depends_on: [postgres, receiver]
+    profiles: ["app"]
+  app-alpine:
+    image: pgtxn-containers-app:alpine
+    environment: *app-env
+    stop_grace_period: 20s
+    depends_on: [postgres, receiver]
+    profiles: ["app"]
+  app-bun:
+    image: pgtxn-containers-app:bun
+    environment: *app-env
+    stop_grace_period: 20s
+    depends_on: [postgres, receiver]
+    profiles: ["app"]
