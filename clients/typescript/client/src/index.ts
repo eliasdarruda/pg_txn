@@ -2,11 +2,11 @@
 //
 //   const pgtxn = new PgTxn(pool)
 //   await pgtxn.transaction(async (tx) => {
-//     const order = await tx.own("orders", id)                     // protected until commit
+//     const [order] = (await tx.db.query("SELECT * FROM orders WHERE id = $1", [id])).rows
 //     const payment = await tx.effect((ctx) => charge(order, ctx.idempotencyKey))  // no lock or connection held
 //     await tx.db.query("UPDATE orders SET status = 'paid' WHERE id = $1", [id])
 //     await tx.spawn(() => email.sendReceipt(id))                   // runs iff this commits
-//   })
+//   }, { key: ["order", id] })                                       // optional: one at a time per order
 //
 // Your function runs in an ordinary database transaction. When it reaches an
 // effect that has not run yet, the transaction is rolled back, the effect is
@@ -16,7 +16,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type Db, type TransactionOptions, isPgPool, pgDb } from "./db.ts";
 import {
-  EffectFailedError, FencedError, OwnershipTimeoutError, PermanentError, RetryableError, TransactionFailedError,
+  EffectFailedError, FencedError, KeyTimeoutError, PermanentError, RetryableError, TransactionFailedError,
   errorJson, sqlDetail, sqlState,
 } from "./errors.ts";
 import { fromTagged, toTagged } from "./serialize.ts";
@@ -38,12 +38,13 @@ export type EffectOptions = {
   /** A label for observability (txn.effects, txn.effect_errors); default: the function's name. */
   name?: string;
   /**
-   * What the effect does, as JSON (e.g. { orderId, amount }). A re-run reuses
-   * the recorded result only if it calls the effect at the same position with
-   * the same key; with a different key it is a new effect and the old one is
-   * orphaned (and compensated). Without a key, reuse is by position.
+   * The data the call depends on, as JSON (e.g. [order.amount]). A re-run
+   * reuses the recorded result only if it reaches the effect at the same
+   * position with the same deps; if they changed (the data changed while the
+   * call ran), it is a new effect and the old one is orphaned (and
+   * compensated). Without deps, reuse is by position.
    */
-  key?: unknown;
+  deps?: unknown;
   /**
    * Off by default: fn is called at most once, and a failure, a timeout or a
    * crash mid-call fails the effect. Turn it on only when fn is safe to call
@@ -99,12 +100,6 @@ export interface Tx<T = any> {
    * process (retried on failure; recorded in txn.effects). Returns its id.
    */
   spawn(fn: (ctx: EffectContext) => unknown, options?: SpawnOptions): Promise<string>;
-  /**
-   * Reads a row and protects it until the transaction commits: nobody else
-   * can change it meanwhile (they get 55P03 at once), and effects only run if
-   * it did not change since it was read. Call it before the first effect.
-   */
-  own<Row = Record<string, unknown>>(table: string, key: unknown): Promise<Row | null>;
   /** When the transaction started: stable across runs. */
   now(): Date;
   /** A random-looking UUID that is the same in every run. */
@@ -120,8 +115,8 @@ export type PgTxnOptions = {
   install?: boolean;
   /** Lease of a transaction or effect this process drives (default 30000). */
   leaseMs?: number;
-  /** Longest wait for a row owned by another transaction (default 300000). */
-  ownerWaitMs?: number;
+  /** Longest wait for another transaction with the same key (default 300000). */
+  keyWaitMs?: number;
   /**
    * Wake the worker with LISTEN/NOTIFY (default true; enqueued transactions
    * start within milliseconds instead of the poll interval). false: poll only.
@@ -133,7 +128,16 @@ export type PgTxnOptions = {
   onError?: (e: unknown) => void;
 };
 
-export type RunOptions = TransactionOptions & { id?: string };
+/** A transaction key: a string, or JSON (e.g. ["order", 42]). */
+export type TxKey = string | readonly unknown[] | Record<string, unknown>;
+
+export type RunOptions = TransactionOptions & {
+  id?: string;
+  /** Transactions with the same key run one at a time (the others wait, holding nothing). */
+  key?: TxKey;
+  /** Several keys, claimed all at once or none (no deadlocks), e.g. both accounts of a transfer. */
+  keys?: readonly TxKey[];
+};
 
 class NeedEffect extends Error {
   constructor() {
@@ -144,11 +148,16 @@ class NeedEffect extends Error {
 
 type Need = { seq: number; name: string; tagged: unknown; fn: (ctx: EffectContext) => unknown; options: EffectOptions };
 type Local = { fn: (ctx: EffectContext, input: any) => unknown; timeoutMs?: number; since: number; txId: string | null; compensation: boolean };
-type Claim = { rel: string; key: unknown; version: string };
 type Action = { seq: number; id: string; action: "execute" | "wait" | "done"; attempt: number; wait_ms: number };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const json = (v: unknown) => JSON.stringify(toTagged(v === undefined ? null : v));
+
+const keyText = (k: TxKey) => (typeof k === "string" ? k : JSON.stringify(k));
+const keysOf = (o: { key?: TxKey; keys?: readonly TxKey[] }) => {
+  const all = [...(o.key === undefined ? [] : [o.key]), ...(o.keys ?? [])].map(keyText);
+  return all.length ? all : null;
+};
 
 const spawnParams = (owner: string, fn: Function, id: string, o: SpawnOptions) =>
   [owner, o.name ?? (fn.name || "spawn"), id, attemptsOf(o.retry), deliveryOf(o.retry), o.delayMs ?? 0];
@@ -165,8 +174,6 @@ class Run<T> implements Tx<T> {
   seq = 0;
   needs: Need[] = [];
   consumed: string[] = [];
-  claims: Claim[] = [];
-  effectCalled = false;
   spawned: string[] = [];
   closed = false;
   #inflight = 0;
@@ -176,13 +183,11 @@ class Run<T> implements Tx<T> {
   readonly id: string;
   private core: PgTxn;
   private startedAt: Date;
-  private claimed: boolean;
 
-  constructor(core: PgTxn, id: string, startedAt: Date, claimed: boolean) {
+  constructor(core: PgTxn, id: string, startedAt: Date) {
     this.core = core;
     this.id = id;
     this.startedAt = startedAt;
-    this.claimed = claimed;
   }
 
   async #q(text: string, params: unknown[]) {
@@ -203,10 +208,9 @@ class Run<T> implements Tx<T> {
 
   async effect<R>(fn: (ctx: EffectContext) => Promise<R> | R, options: EffectOptions = {}): Promise<R> {
     if (typeof fn !== "function") throw new TypeError("tx.effect(fn, options?): fn must be a function");
-    this.effectCalled = true;
     const seq = this.seq++;
     const name = options.name ?? (fn.name || "effect");
-    const tagged = toTagged(options.key === undefined ? null : options.key);
+    const tagged = toTagged(options.deps === undefined ? null : options.deps);
     const r = (await this.#q("SELECT effect_id, status, result, error FROM txn.effect_lookup($1, $2, $3, $4::jsonb)",
       [this.id, seq, name, JSON.stringify(tagged)])).rows[0];
     if (r.status === "succeeded") {
@@ -230,17 +234,6 @@ class Run<T> implements Tx<T> {
     this.spawned.push(id);
     await this.#q("SELECT txn.spawn($1, $2, $3, $4, $5, $6)", spawnParams(this.core.owner, fn, id, options));
     return id;
-  }
-
-  async own<Row = Record<string, unknown>>(table: string, key: unknown): Promise<Row | null> {
-    if (this.effectCalled) {
-      throw new Error(`pg_txn: own("${table}") after an effect: own the rows a transaction depends on before its first effect`);
-    }
-    const r = (await this.#q('SELECT "row", version, key, rel::text AS rel FROM txn.own($1::regclass, $2::jsonb)',
-      [table, JSON.stringify(key)])).rows[0];
-    if (!r) return null;
-    if (!this.claimed) this.claims.push({ rel: r.rel, key: r.key, version: r.version });
-    return r.row as Row;
   }
 
   now(): Date {
@@ -283,7 +276,7 @@ export class PgTxn<T = any> {
       pollMs: options.pollMs ?? 250,
       install: options.install ?? true,
       leaseMs: options.leaseMs ?? 30_000,
-      ownerWaitMs: options.ownerWaitMs ?? 300_000,
+      keyWaitMs: options.keyWaitMs ?? 300_000,
       onError: options.onError ?? ((e) => console.error("pg_txn worker:", e)),
       listen: options.listen ?? true,
     };
@@ -339,10 +332,31 @@ export class PgTxn<T = any> {
 
   // ------------------------------------------------------------------ running
 
-  /** Runs fn as one transaction that may include effects. */
+  /**
+   * Runs fn as one transaction that may include effects. With a key,
+   * transactions with the same key run one at a time.
+   */
   async transaction<R>(fn: (tx: Tx<T>) => Promise<R> | R, options: RunOptions = {}): Promise<R> {
     await this.ready();
-    return this.#drive(options.id ?? randomUUID(), (tx) => fn(tx), new Date(), options);
+    const id = options.id ?? randomUUID();
+    if (!keysOf(options)) return this.#drive(id, (tx) => fn(tx), new Date(), options);
+    const startedAt = await this.#start(id, null, null, options);
+    return this.#drive(id, (tx) => fn(tx), startedAt, options);
+  }
+
+  // Records the transaction as running (named, or holding keys); with a key
+  // held by another transaction, waits for that one to end first.
+  async #start(id: string, name: string | null, input: unknown, options: RunOptions): Promise<Date> {
+    const keys = keysOf(options);
+    const since = Date.now();
+    for (;;) {
+      const r = (await this.db.query(null, "SELECT created_at, holder FROM txn.start($1, $2, $3::jsonb, $4, $5, $6::text[])",
+        [id, name, name === null ? null : json(input), this.owner, this.#opts.leaseMs, keys])).rows[0];
+      if (!r.holder) return new Date(r.created_at);
+      await this.#waitFor(r.holder, () => {
+        if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys!.join(", "), r.holder, Date.now() - since);
+      });
+    }
   }
 
   /** Runs a defined transaction now, in this process (resumable elsewhere if it stops). */
@@ -351,18 +365,19 @@ export class PgTxn<T = any> {
     if (!fn) throw new Error(`pg_txn: no transaction named ${name} is defined in this process`);
     await this.ready();
     const id = options.id ?? randomUUID();
-    const r = await this.db.query(null, "SELECT txn.start($1, $2, $3::jsonb, $4, $5) AS created_at",
-      [id, name, json(input), this.owner, this.#opts.leaseMs]);
-    return this.#drive(id, (tx) => fn(tx, input), new Date(r.rows[0].created_at), options) as Promise<R>;
+    const startedAt = await this.#start(id, name, input, options);
+    return this.#drive(id, (tx) => fn(tx, input), startedAt, options) as Promise<R>;
   }
 
   /**
    * Queues a defined transaction to run in the background on any process that
    * defines it. With trx (a database transaction), it is queued iff that commits.
+   * With keys, it runs when no other transaction holds any of them.
    */
-  async enqueue(name: string, input: unknown, options: { trx?: T; id?: string } = {}): Promise<string> {
+  async enqueue(name: string, input: unknown, options: { trx?: T; id?: string; key?: TxKey; keys?: readonly TxKey[] } = {}): Promise<string> {
     await this.ready();
-    const r = await this.db.query(options.trx ?? null, "SELECT txn.enqueue($1, $2::jsonb, $3) AS id", [name, json(input), options.id ?? null]);
+    const r = await this.db.query(options.trx ?? null, "SELECT txn.enqueue($1, $2::jsonb, $3, $4::text[]) AS id",
+      [name, json(input), options.id ?? null, keysOf(options)]);
     this.#wake?.();
     return r.rows[0].id;
   }
@@ -422,10 +437,9 @@ export class PgTxn<T = any> {
   }
 
   async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
-    let claimed = false;
     let retries = 0;
     for (;;) {
-      const run = new Run<T>(this, txId, startedAt, claimed);
+      const run = new Run<T>(this, txId, startedAt);
       try {
         const out = await this.db.transaction(async (trx) => {
           run.db = trx;
@@ -442,16 +456,12 @@ export class PgTxn<T = any> {
         run.closed = true;
         for (const id of run.spawned) this.#local.delete(id);
         if (run.needs.length) {
-          if (await this.#perform(txId, run)) claimed = true;
+          await this.#perform(txId, run);
           continue;
         }
         const state = sqlState(e);
         const detail = sqlDetail(e) ?? "";
         if (state === "55P03" && detail === "fenced") throw new FencedError(txId);
-        if (state === "55P03" && detail.startsWith("owner=")) {
-          await this.#waitFor(detail.slice(6));
-          continue;
-        }
         if ((state === "40001" || state === "40P01") && retries++ < 100) {
           await sleep(Math.min(1000, 5 * 2 ** Math.min(retries, 8)) * Math.random());
           continue;
@@ -463,40 +473,23 @@ export class PgTxn<T = any> {
     }
   }
 
-  async #prepare(txId: string, needs: Need[], claims: Claim[]): Promise<{ conflict?: any; effects?: Action[] }> {
+  async #prepare(txId: string, needs: Need[]): Promise<{ conflict?: any; effects?: Action[] }> {
     const effects = needs.map((n) => ({
       seq: n.seq, name: n.name, input: n.tagged, max_attempts: attemptsOf(n.options.retry),
       delivery: deliveryOf(n.options.retry),
       compensation: n.options.compensate ? (n.options.compensate.name || `undo ${n.name}`) : null,
     }));
-    const r = await this.db.query(null, "SELECT txn.prepare_effects($1, $2, $3, $4::jsonb, $5::jsonb) AS r",
-      [txId, this.owner, this.#opts.leaseMs, JSON.stringify(effects), JSON.stringify(claims)]);
+    const r = await this.db.query(null, "SELECT txn.prepare_effects($1, $2, $3, $4::jsonb) AS r",
+      [txId, this.owner, this.#opts.leaseMs, JSON.stringify(effects)]);
     return r.rows[0].r;
   }
 
-  // Claims the rows (once, all or nothing), then calls the needed effects
-  // outside of any transaction. Returns whether the claims are now in place.
-  async #perform(txId: string, run: Run<T>): Promise<boolean> {
-    let prep: { conflict?: any; effects?: Action[] };
-    try {
-      prep = await this.#prepare(txId, run.needs, run.claims);
-    } catch (e) {
-      // lost a claim race to a transaction that claimed the same row at the same time
-      const detail = sqlDetail(e) ?? "";
-      if (sqlState(e) === "55P03" && detail.startsWith("owner=")) {
-        await this.#waitFor(detail.slice(6));
-        return false;
-      }
-      throw e;
-    }
-    if (prep.conflict) {
-      const c = prep.conflict;
-      if (c.reason === "fenced") throw new FencedError(txId);
-      if (c.reason === "owned") await this.#waitFor(c.owner);
-      return false;
-    }
+  // Takes the lease and records the intents, then calls the needed effects
+  // outside of any transaction.
+  async #perform(txId: string, run: Run<T>): Promise<void> {
+    const prep = await this.#prepare(txId, run.needs);
+    if (prep.conflict) throw new FencedError(txId);
     await Promise.all(prep.effects!.map((a) => this.#execute(txId, run.needs.find((n) => n.seq === a.seq)!, a)));
-    return true;
   }
 
   async #execute(txId: string, need: Need, action: Action): Promise<void> {
@@ -513,7 +506,7 @@ export class PgTxn<T = any> {
       } else {
         await sleep(action.wait_ms);
       }
-      const prep = await this.#prepare(txId, [need], []);
+      const prep = await this.#prepare(txId, [need]);
       if (prep.conflict) throw new FencedError(txId);
       action = prep.effects![0];
     }
@@ -545,12 +538,11 @@ export class PgTxn<T = any> {
     }
   }
 
-  async #waitFor(owner: string): Promise<void> {
-    const start = Date.now();
+  async #waitFor(txId: string, check: () => void): Promise<void> {
     for (let ms = 5; ; ms = Math.min(ms * 1.5, 200)) {
-      const r = (await this.db.query(null, "SELECT status FROM txn.status($1)", [owner])).rows[0];
+      const r = (await this.db.query(null, "SELECT status FROM txn.status($1)", [txId])).rows[0];
       if (!r || r.status !== "running") return;
-      if (Date.now() - start > this.#opts.ownerWaitMs) throw new OwnershipTimeoutError(owner, Date.now() - start);
+      check();
       await sleep(ms);
     }
   }

@@ -322,7 +322,7 @@ defmodule PgTxn.Worker do
 
   defp drive(state, owner, fun, t) do
     input = DJSON.from_tagged(t["input"])
-    Loop.drive(state.repo, t["id"], fn tx -> fun.(tx, input) end, t["created_at"], named: true, owner: owner)
+    Loop.drive(state.repo, t["id"], fn tx -> fun.(tx, input) end, started_at: t["created_at"], named: true, owner: owner)
   rescue
     FencedError -> :fenced
     e -> Logger.error("pg_txn worker: transaction #{t["name"]} #{t["id"]} failed: #{Exception.message(e)}")

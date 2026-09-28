@@ -42,7 +42,7 @@ import { orders } from "./schema"
 
 export const checkout = (orderId: number) =>
   pgtxn.transaction(async (tx) => {
-    const order = await tx.own("orders", orderId)        // nobody else can change it until this commits
+    const [order] = await tx.db.select().from(orders).where(eq(orders.id, orderId))
     if (order?.status !== "new") return null
 
     const payment = await tx.effect(
@@ -59,7 +59,7 @@ export const checkout = (orderId: number) =>
     await tx.db.update(orders).set({ status: "paid", paymentId: payment.id }).where(eq(orders.id, orderId))
     await tx.spawn(() => mailer.sendReceipt(orderId))    // runs iff this commits
     return payment.id
-  })
+  }, { key: ["order", orderId] })                          // one checkout per order at a time
 ```
 
 What happens:
@@ -67,10 +67,12 @@ What happens:
 1. **First run.** The function runs in a database transaction. It reaches
    the charge, which has not run yet, so that transaction is rolled back.
 2. **The charge.** It is made outside of any transaction and its result is
-   recorded. The order stays owned the whole time, and no lock or
-   connection is held.
-3. **Second run.** The function runs again. `tx.effect` returns the
-   recorded payment, and the update commits.
+   recorded. No lock or connection is held; the key makes a second checkout
+   of the same order wait.
+3. **Second run.** The function runs again on fresh data. `tx.effect`
+   returns the recorded payment, and the update commits. If the order had
+   been cancelled meanwhile, the function would return early instead, and
+   the unused charge would be refunded.
 4. **After the commit.** This process sends the receipt.
 5. **If the transaction fails later,** the charge is refunded.
 
@@ -79,20 +81,26 @@ What happens:
 ### `pgtxn.transaction(fn, options?)`
 
 Runs `fn(tx)` as one transaction that may include effects, and returns what
-`fn` returns. If `fn` throws, nothing it wrote is committed. Options:
-`id` (the transaction id) and `isolation`.
+`fn` returns. If `fn` throws, nothing it wrote is committed.
+
+| option | |
+|---|---|
+| `key` | transactions with the same key run one at a time; the others wait, holding nothing. A string, or JSON such as `["order", id]`. |
+| `keys` | several keys, claimed all at once or none (no deadlocks), e.g. `[["account", from], ["account", to]]` |
+| `id` | the transaction id |
+| `isolation` | e.g. `"serializable"` |
+
+Without a key, concurrency is optimistic. Every run re-reads your data, so
+the committing run writes on current data. If data changed while an effect
+ran, the re-run takes another path (the unused effect is compensated) or
+calls the effect with different `deps` (a new effect; the old one is
+compensated). Use a key where contention is expected, so it never costs a
+compensation.
 
 ### `tx.db`
 
 Your database transaction for this run: the Drizzle, Knex or node-postgres
 transaction. Use it for all of your queries.
-
-### `tx.own(table, key)`
-
-Reads a row and protects it until the transaction ends. Other writers get
-`55P03` at once, and another pg_txn transaction waits for this one. It
-returns the row with its column names, or `null`. Call it before the first
-effect. `key` is the primary key value, or an object for a composite key.
 
 ### `tx.effect(fn, options?)`
 
@@ -106,7 +114,7 @@ same across retries and crashes.
 | `retry` | off | `true` (5 attempts) or `{ attempts }`. Without it, `fn` is called at most once, and a failure, timeout or crash mid-call fails the effect. Turn it on only if `fn` is safe to repeat. |
 | `compensate` | | `(result, ctx) => …`: undoes the effect if the transaction does not use its result. Uses the same `retry`. |
 | `timeoutMs` | 30000 | per attempt; aborts `ctx.signal` |
-| `key` | | JSON describing the call; a re-run with a different key makes a new effect and compensates the old one |
+| `deps` | | the data the call depends on, e.g. `[order.total]`: if a re-run reaches the effect with different deps, it is a new effect and the old one is compensated |
 | `name` | the function's name | a label in `txn.effects` |
 
 With `retry` on:
@@ -145,8 +153,8 @@ await db.transaction(async (trx) => {
 ```ts
 const settle = pgtxn.define("settle", async (tx, { invoiceId }: { invoiceId: number }) => { … })
 
-await settle({ invoiceId: 7 })                          // runs here; resumed elsewhere if this process dies
-const id = await pgtxn.enqueue("settle", { invoiceId: 7 })   // runs on any replica that defines it
+await settle({ invoiceId: 7 }, { key: ["invoice", 7] })          // runs here; resumed elsewhere if this process dies
+const id = await pgtxn.enqueue("settle", { invoiceId: 7 }, { key: ["invoice", 7] })   // on any replica that defines it
 await pgtxn.wait(id)                                    // its output
 ```
 
@@ -165,7 +173,7 @@ A timestamp and UUIDs that are the same in every run.
 |---|---|---|
 | `concurrency` | 16 | spawned functions, compensations and background transactions run at once |
 | `leaseMs` | 30000 | lease of a transaction or effect this process drives |
-| `ownerWaitMs` | 300000 | how long to wait for a row owned by another transaction (`OwnershipTimeoutError`) |
+| `keyWaitMs` | 300000 | how long to wait for a key another transaction holds (`KeyTimeoutError`) |
 | `listen` | `true` | wake the worker with LISTEN. Use `false` or `{ connectionString }` (a direct endpoint) behind RDS Proxy. |
 | `pollMs` | 250 | idle poll interval of the worker |
 | `install` | `true` | install the `txn` schema if it is missing |

@@ -1,6 +1,6 @@
 // A process that stops mid-transaction loses nothing: named transactions are
 // resumed by another process (recorded effects reused, the same idempotency
-// key), inline ones are abandoned (rows released), and a stalled process that
+// key), inline ones are abandoned (their key released), and a stalled process that
 // wakes up late cannot record anything (fencing).
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -17,12 +17,11 @@ const CHILD = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/
 
 // the surviving process defines the same transaction
 survivor.define("pay", async (tx, input: { orderId: number }) => {
-  await tx.own("orders", input.orderId);
   const p = await tx.effect(async (ctx) => {
     await pool.query("INSERT INTO ledger (account_id, amount, ref) SELECT $1, 10, $2 WHERE NOT EXISTS (SELECT 1 FROM ledger WHERE ref = $2)",
       [input.orderId, ctx.idempotencyKey]);
     return { id: `pay_${ctx.idempotencyKey.slice(0, 8)}` };
-  }, { name: "charge", key: input, retry: true, compensate: async (p) => { refunds.push(p); } });
+  }, { name: "charge", deps: input, retry: true, compensate: async (p) => { refunds.push(p); } });
   await tx.db.query("UPDATE orders SET status = 'paid', payment_id = $2 WHERE id = $1", [input.orderId, p.id]);
   return p.id;
 });
@@ -71,7 +70,7 @@ describe("recovery", () => {
     assert.deepEqual(await outcomes(c.txId), ["succeeded"], "the charge ran once; the recorded result was reused");
   });
 
-  test("an inline transaction whose process stops is abandoned: rows released, its compensation reported lost", async () => {
+  test("an inline transaction whose process stops is abandoned; its compensation is reported lost", async () => {
     const id = await newOrder(pool);
     const c = start("inline-hang", id);
     await c.next("beforeCommit");

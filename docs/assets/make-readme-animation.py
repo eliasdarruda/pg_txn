@@ -8,11 +8,13 @@ and a counter on each side ticks up with the hops:
   outbox   API service -> PostgreSQL -> relay -> broker -> worker -> Redis,
            Payments API, PostgreSQL again, and on failure the retry / DLQ
            topic and a DLQ handler: 10 hops, 5 services + Redis
-  pg_txn   a SQL schema plus a library in the app, on stock PostgreSQL. Run 1
-           reads and owns the order in a short DB transaction, reaches the
-           effect and rolls back (nothing held); the app charges the Payments
-           API with the effect id as idempotency key and records the result;
-           run 2 writes 'paid', spawns the receipt and commits atomically; the
+  pg_txn   a SQL schema plus a library in the app, on stock PostgreSQL. The
+           transaction takes key order:42 in txn.start (a row in txn.keys,
+           not a lock), then run 1 reads order 42 in a short DB transaction,
+           reaches the effect and rolls back (no lock, transaction or
+           connection held); the app charges the Payments API with the effect
+           id as idempotency key and records the result; run 2 writes 'paid',
+           spawns the receipt, releases the key and commits atomically; the
            app's in-process worker sends the receipt: 6 hops, 1 service
 
 Pure SVG + SMIL (no scripts), so it animates when embedded in a GitHub README
@@ -190,10 +192,11 @@ def icon_mail(x, y, label):
 </g>'''
 
 
-def crown(x, y, cls, t0, t1):
-    """ownership of a row: claimed until commit, no lock held."""
+def key_glyph(x, y, cls, t0, t1):
+    """a transaction key: a row in txn.keys, held until the commit; no lock."""
     return (f'<g opacity="0" transform="translate({x},{y})">{visible(t0, t1)}'
-            f'<path d="M-10,7 L-10,-5 L-5,1 L0,-9 L5,1 L10,-5 L10,7 Z" class="crownc {cls}"/></g>')
+            f'<circle cx="-5" cy="0" r="4.5" class="keyc {cls}"/>'
+            f'<path d="M-0.5,0 H10 M6,0 v4 M9,0 v3" class="keyc {cls}"/></g>')
 
 
 def card(x, y, w, lines, cls, t0, t1):
@@ -363,7 +366,7 @@ def panel_pgtxn():
          text(24, 60, "SQL schema + in-app library", "sub", "start")]
     p += [link(app_b, pg_top), link(app_pay, api_l), link(app_mail, mail_l)]
     hops = [  # (n, from, to, slot, bounce, marker side, marker frac)
-        ("1", app_b, pg_top, 0, True, 1, 0.3),    # run 1: read and own order 42
+        ("1", app_b, pg_top, 0, True, 1, 0.3),    # txn.start takes key order:42; run 1 reads order 42
         ("2", app_b, pg_top, 1, False, -1, 0.3),  # the effect has not run: ROLLBACK
         ("3", app_pay, api_l, 2, True, 1, 0.5),   # charge, effect id = idempotency key
         ("4", app_b, pg_top, 3, False, -1, 0.72), # record the result
@@ -383,11 +386,12 @@ def panel_pgtxn():
                             "a Postgres extension"]):
         p.append(text(214, 424 + i * 16, s_, "tiny gone", "start"))
 
-    # rows inside PostgreSQL: the order is owned (a crown, not a lock) from run 1 to the commit
+    # rows inside PostgreSQL: the order is held under key order:42 (a row in txn.keys, not a lock)
+    # from txn.start to the commit
     rx, rw = 110, 172
     p.append(row(rx, 432, rw, "order 42", [("new", "chip-neutral", arrive(0), arrive(4), 50),
                                            ("paid", "chip-good", arrive(4), END, 50)]))
-    p.append(crown(rx + 6, 431, "t", arrive(0), arrive(4)))
+    p.append(key_glyph(rx + 6, 431, "t", slot(0) + 0.3, arrive(4)))
     p.append(row(rx, 462, rw, "effect #1", [("recorded", "chip-good", arrive(3), END, 74)]))
     p.append(row(rx, 492, rw, "receipt", [("committed", "chip-good", arrive(4), END, 80)]))
 
@@ -399,6 +403,7 @@ def panel_pgtxn():
     p.append(badge(app[0], 92, "run 1", "chip-t", slot(0), arrive(1), 58))
     p.append(badge(app[0], 92, "run 2", "chip-t", slot(4), arrive(4) + 0.3, 58))
     p.append(badge(api[0], 92, "key = effect id", "chip-good", slot(2), slot(4), 120))
+    p.append(badge(172, 266, "key order:42", "chip-t", slot(0) + 0.3, arrive(4), 100))
     zero = ["0 open transactions", "0 row locks", "0 connections held"]
     p.append(card(203, 314, 146, zero, "chip-good", arrive(1), slot(3)))
     p.append(badge(mail[0], 318, "receipt sent", "chip-good", arrive(5), slot(8), 104))
@@ -407,6 +412,7 @@ def panel_pgtxn():
     # and the retry is recorded in PostgreSQL
     p.append(dot(app_pay, api_l, slot(8), "dwarn", True))
     p.append(badge(api[0], 92, "timeout", "chip-warn", slot(8) + 0.4, slot(10), 70))
+    p.append(badge(172, 266, "key order:42", "chip-t", slot(8) + 0.3, END, 100))
     p.append(card(203, 314, 146, zero, "chip-good", slot(8) + 0.3, slot(9)))
     p.append(dot(app_b, pg_top, slot(9), "dwarn"))
     p.append(badge(262, 350, "retry kept in Postgres", "chip-warn", arrive(9), END, 166))
@@ -417,11 +423,11 @@ def panel_pgtxn():
                      + [("6", slot(5), END)], "t"))
 
     caps = [  # (slot, hop number, text)
-        (0, "1", "run 1, a short DB transaction:\nread order 42 and own it"),
+        (0, "1", "key order:42 taken; run 1, a short\nDB transaction: read order 42"),
         (1, "2", "the charge hasn't run yet: ROLLBACK.\nnothing is held while it runs"),
         (2, "3", "the app charges, keyed by the effect id"),
         (3, "4", "the result is recorded in Postgres"),
-        (4, "5", "run 2: 'paid' + spawn + COMMIT,\natomically, in one DB transaction"),
+        (4, "5", "run 2: 'paid' + spawn + COMMIT,\nkey released, in one DB transaction"),
         (5, "6", "after the commit, the app's own\nworker sends the receipt"),
         (6, None, "done: one function, nothing else runs"),
         (8, None, "if the charge fails instead: timeout"),
@@ -436,16 +442,16 @@ def panel_pgtxn():
     p.append(f'<line x1="24" y1="{RULEY}" x2="{pw - 24}" y2="{RULEY}" class="rule"/>')
     p.append(text(24, RULEY + 22, "your code for this checkout: checkout.ts", "tiny", "start"))
     code = ["await pgtxn.transaction(async (tx) =&gt; {",
-            "  const order = await tx.own(\"orders\", id)",
+            "  const [order] = await tx.db.select()…",
             "  const p = await tx.effect(() =&gt; charge(order))",
-            "  await tx.db.query(MARK_PAID, [id, p.id])",
+            "  await tx.db.update(orders)…",
             "  await tx.spawn(() =&gt; sendReceipt(id))",
-            "})"]
+            "}, { key: [\"order\", id] })"]
     lh, h = 14, 6 * 14 + 14
     p.append(f'<rect x="20" y="{CODEY}" width="{pw - 40}" height="{h}" rx="6" class="file"/>')
     p.append(f'<rect x="20" y="{CODEY}" width="{pw - 40}" height="{h}" rx="6" class="file-on t" opacity="0">'
              f'{visible(slot(0), END)}</rect>')
-    marks = [(0, 1, slot(0), slot(1)), (2, 2, slot(1), slot(4)), (0, 5, slot(4), slot(5)),
+    marks = [(0, 1, slot(0), slot(1)), (5, 5, slot(0), slot(1)), (2, 2, slot(1), slot(4)), (0, 5, slot(4), slot(5)),
              (4, 4, slot(5), slot(6)), (2, 2, slot(8), END)]
     for a, b, t0, t1 in marks:
         p.append(f'<rect x="24" y="{CODEY + 6 + a * lh}" width="{pw - 48}" height="{(b - a + 1) * lh + 1}" rx="3" '
@@ -481,7 +487,7 @@ text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans
 .libt { font-size: 12.5px; font-weight: 700; fill: var(--t); } .libc rect { fill: var(--t); }
 .flap { fill: none; stroke: var(--ink); stroke-width: 2; stroke-linejoin: round; }
 .schema { font-size: 10.5px; fill: var(--muted); font-weight: 600; }
-.crownc.t { fill: var(--t); } .chip-t { fill: var(--t); }
+.keyc { fill: none; stroke-width: 2.4; stroke-linecap: round; } .keyc.t { stroke: var(--t); } .chip-t { fill: var(--t); }
 .hl { stroke: none; fill-opacity: .2; } .hl.t { fill: var(--t); }
 .head { font-size: 13.5px; font-weight: 600; } .head .ht { fill: var(--t); font-weight: 800; }
 .link { stroke: var(--line); stroke-width: 2; stroke-dasharray: 5 6; } .warnl { stroke-dasharray: 2 5; }
@@ -501,7 +507,7 @@ HEADER = ('<text x="500" y="30" class="head" text-anchor="middle"><tspan class="
 
 def main():
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img"
-  aria-label="Animation: the same checkout with a transactional outbox and with pg_txn. Outbox: the API service writes the order and an outbox row, a relay polls it, publishes to a broker and marks it sent, a worker consumes it, checks Redis for duplicates, charges the payment API and writes the result back with a version check, and on failure a retry / DLQ topic and a DLQ handler take over: 10 network hops across 5 services plus Redis. pg_txn, a SQL schema plus a library in the app on stock PostgreSQL: run 1 reads and owns the order in a short DB transaction, reaches the charge and rolls back, so no transaction, lock or connection is held while the app charges the payment API with the effect id as idempotency key; the result is recorded in PostgreSQL; run 2 writes paid, spawns the receipt and commits atomically in one DB transaction; after the commit the app's in-process worker sends the receipt. On failure the app retries the charge with the same key and the retry is recorded in PostgreSQL: 6 hops, 1 service, one function.">
+  aria-label="Animation: the same checkout with a transactional outbox and with pg_txn. Outbox: the API service writes the order and an outbox row, a relay polls it, publishes to a broker and marks it sent, a worker consumes it, checks Redis for duplicates, charges the payment API and writes the result back with a version check, and on failure a retry / DLQ topic and a DLQ handler take over: 10 network hops across 5 services plus Redis. pg_txn, a SQL schema plus a library in the app on stock PostgreSQL: the transaction takes key order:42, a row in txn.keys rather than a lock, then run 1 reads order 42 in a short DB transaction, reaches the charge and rolls back, so no transaction, lock or connection is held while the app charges the payment API with the effect id as idempotency key; the result is recorded in PostgreSQL; run 2 writes paid, spawns the receipt, releases the key and commits atomically in one DB transaction; after the commit the app's in-process worker sends the receipt. On failure the app retries the charge with the same key and the retry is recorded in PostgreSQL: 6 hops, 1 service, one function.">
 <title>Transactional outbox vs pg_txn</title>
 <style>{STYLE}</style>
 <rect width="{W}" height="{H}" class="bg"/>

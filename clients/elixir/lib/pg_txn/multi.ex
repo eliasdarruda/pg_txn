@@ -27,7 +27,10 @@ defmodule PgTxn.Multi do
     end)
   end
 
-  @doc "A named transaction queued iff the Multi commits (see `PgTxn.enqueue/4`); the step's value is its id."
+  @doc """
+  A named transaction queued iff the Multi commits (see `PgTxn.enqueue/4`;
+  options `:id`, `:key` and `:keys`); the step's value is its id.
+  """
   @spec enqueue(Multi.t(), Multi.name(), String.t(), term | (map -> term), keyword) :: Multi.t()
   def enqueue(multi, step, name, input, opts \\ []) do
     Multi.run(multi, step, fn repo, changes -> {:ok, PgTxn.enqueue(repo, name, resolve(input, changes), opts)} end)

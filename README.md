@@ -29,11 +29,11 @@ With pg_txn it is **one function**:
 
 ```ts
 await pgtxn.transaction(async (tx) => {
-  const order = await tx.own("orders", id)                      // nobody else can change it until commit
+  const [order] = await tx.db.select().from(orders).where(eq(orders.id, id))
   const payment = await tx.effect(() => charge(order))          // runs holding no lock, connection or transaction
   await tx.db.update(orders).set({ paymentId: payment.id }).where(eq(orders.id, id))
   await tx.spawn(() => sendReceipt(id))                         // runs iff this commits
-})
+}, { key: ["order", id] })                                      // optional: one at a time per order
 ```
 
 pg_txn is a SQL schema and a small library. There is no extension to build
@@ -59,7 +59,7 @@ and no service to run, and it works with any ORM on stock PostgreSQL.
 | where the logic lives | relay + broker + worker + DLQ handler | one function |
 | call an API **and use its result** in the transaction | a second transaction, a state column, a guard | `await tx.effect(…)`, then write |
 | fire-and-forget after commit | outbox row + relay | `tx.spawn(() => …)` |
-| data unchanged between decision and write-back | version checks on every write path | `tx.own(row)` |
+| concurrent operations on the same data | version checks on every write path | `{ key }`, or optimistic re-runs |
 | idempotency key stable across retries and crashes | yours to build | `ctx.idempotencyKey` |
 | services to run | relay, broker, workers | none |
 
@@ -137,7 +137,7 @@ const payment = await tx.effect(
 ## Multi-row transactions without locks
 
 <p align="center">
-  <img src="docs/assets/multi-actor-transfer.svg" alt="A two-account transfer with a slow external call: row locks and a deadlock in plain PostgreSQL, owned rows and no locks with pg_txn" width="1000">
+  <img src="docs/assets/multi-actor-transfer.svg" alt="A two-account transfer with a slow external call: row locks and a deadlock in plain PostgreSQL, keys and no locks with pg_txn" width="1000">
 </p>
 
 In plain PostgreSQL, a transfer that asks a fraud service before moving money
@@ -147,41 +147,47 @@ has two bad options:
   connections are pinned, and crossing transfers deadlock.
 - **Don't lock:** a concurrent change is lost.
 
-With pg_txn the transaction **owns** both rows until it commits, without
-holding a lock:
+With pg_txn the transaction takes **keys** for both accounts. They work like
+advisory locks, but they hold no lock, connection or transaction while the
+call runs:
 
 ```ts
 await pgtxn.transaction(async (tx) => {
-  const a = await tx.own("accounts", from)
-  await tx.own("accounts", to)
+  const [a] = await tx.db.select().from(accounts).where(eq(accounts.id, from))
   const verdict = await tx.effect(() => fraudCheck(from, to, amount))   // seconds or minutes
   if (verdict.blocked || a.balance < amount) throw new Error("refused")  // nothing is written
   await tx.db.update(accounts).set({ balance: sql`balance - ${amount}` }).where(eq(accounts.id, from))
   await tx.db.update(accounts).set({ balance: sql`balance + ${amount}` }).where(eq(accounts.id, to))
-})
+}, { keys: [["account", from], ["account", to]] })
 ```
 
-- **Nobody interleaves.** Other writes to an owned row fail at once with
-  `55P03`. Another pg_txn transaction waits, outside any transaction.
-- **No deadlocks.** A transaction claims all its rows at once or none, and
-  nobody waits while holding anything.
-- **Decisions on current data.** An effect only runs if the owned rows are
-  unchanged since they were read. Otherwise your function first runs again
-  on fresh data.
+- **Nobody interleaves.** Another transfer touching either account waits for
+  this one, outside any transaction.
+- **No deadlocks.** All of a transaction's keys are claimed at once or none,
+  so nobody waits while holding one.
+- **Nothing to set up.** Keys are just names: no tables to register, no
+  triggers, no DDL.
+
+Without keys, pg_txn is optimistic. Each run re-reads your data, so the run
+that commits always writes on current data. If something changed while an
+effect ran, the re-run either takes another path, and the unused effect is
+compensated, or calls the effect with different `deps` (a new call, and the
+old one is compensated).
 
 ## How it works
 
 pg_txn is a protocol between a SQL schema and a small client loop:
 
-1. **Run.** Your function runs in an ordinary transaction. `tx.effect`
-   looks up a recorded result, and `tx.own` reads the row with its version.
-2. **Effect.** If an effect has not run, the run is rolled back.
-   `txn.prepare_effects` claims the owned rows, all or nothing and
-   version-checked. The client then calls the effect and records its result.
-3. **Commit.** The next run reuses every recorded result. `txn.finish` then
-   does three things in the run's own commit: it releases the rows,
-   schedules compensations for unused results, and stores the outcome.
-4. **Workers.** Each process runs its spawned functions and compensations
+1. **Keys.** With keys, `txn.start` claims them all or none, and waits for
+   their holder otherwise.
+2. **Run.** Your function runs in an ordinary transaction. `tx.effect`
+   looks up a recorded result.
+3. **Effect.** If an effect has not run, the run is rolled back. The client
+   records the intent, calls the effect and records its result.
+4. **Commit.** The next run reuses every recorded result. `txn.finish` then
+   does three things in the run's own commit: it schedules compensations for
+   unused results, releases the keys, and stores the outcome.
+5. **Workers.** Each process runs its spawned functions and compensations
    right after the commit, and runs or resumes named transactions
    (`define`, `enqueue`) that any replica defines.
 
@@ -210,7 +216,7 @@ others are rolled and scaled. Every transaction commits exactly once. See
 ```sql
 SELECT * FROM txn.doctor();                                  -- workers, stuck, lost or orphaned work
 SELECT * FROM txn.running_transactions;                      -- in flight, for how long
-SELECT * FROM txn.owned;                                     -- owned rows, by whom
+SELECT * FROM txn.keys;                                      -- keys held, by which transaction
 SELECT name, error_name, count(*) FROM txn.effect_errors     -- what is failing
  WHERE finished_at > now() - interval '15 min' GROUP BY 1, 2;
 ```
@@ -225,7 +231,7 @@ concurrent clients
 |---|---:|---:|
 | plain `BEGIN … COMMIT` (a read and an update) | 0.86 ms | 7,500 tx/s |
 | the same in pg_txn, no effect | 1.05 ms | 6,400 tx/s |
-| pg_txn: own a row + one effect + write back | 4.2 ms | 760–1,440 tx/s |
+| pg_txn: read + one effect + write back | 4.2 ms | 760–1,440 tx/s |
 | hand-rolled LISTEN/NOTIFY outbox, commit → delivery | 0.26 ms | 900–1,700 events/s |
 | pg_txn `spawn()`, commit → delivery | 1–2 ms | ~1,800 events/s |
 
@@ -249,9 +255,10 @@ while it runs.
   or wait on humans.
 - **Your function runs once per round of effects.** Put side effects in
   `tx.effect` or `tx.spawn`; anything else repeats on every run.
-- **Own before the first effect.** Other rows behave like ordinary rows.
+- **Keys are cooperative,** like advisory locks: they order pg_txn
+  transactions that use them. Plain SQL writes are not blocked.
 - **Crash recovery needs a name.** `define`/`enqueue` transactions resume on
-  another replica. An inline `transaction(fn)` is abandoned (its rows are
+  another replica. An inline `transaction(fn)` is abandoned (its keys are
   released) if its process dies.
 - **Spawned and compensation functions live in their process.** If the
   process dies between the commit and the call, the effect is marked

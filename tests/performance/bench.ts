@@ -58,11 +58,11 @@ const noEffect = (i: number) => pgtxn.transaction(async (tx) => {
   await tx.db.query("UPDATE bench_orders SET note = 'x' WHERE id = $1", [i + 1]);
 });
 const oneEffect = (i: number) => pgtxn.transaction(async (tx) => {
-  await tx.own("bench_orders", i + 1);
+  await tx.db.query("SELECT status FROM bench_orders WHERE id = $1", [i + 1]);
   const r = await tx.effect(async () => ({ ok: true }));
   await tx.db.query("UPDATE bench_orders SET note = $2 WHERE id = $1", [i + 1, String(r.ok)]);
 });
-for (const [name, f] of [["plain BEGIN … COMMIT (baseline)", plain], ["pg_txn, no effect", noEffect], ["pg_txn, own + 1 effect", oneEffect]] as const) {
+for (const [name, f] of [["plain BEGIN … COMMIT (baseline)", plain], ["pg_txn, no effect", noEffect], ["pg_txn, read + 1 effect", oneEffect]] as const) {
   await timed(20, f);
   const lat = await timed(N, f);
   const tps = await throughput(BURST, f);

@@ -11,18 +11,15 @@
 --     txn.attempt(tx, owner)              marks the session as running tx
 --     txn.effect_lookup(tx, seq, name, input)
 --                                         memoized result of effect #seq, or 'missing'
---     txn.own(table, key)                 reads a row the transaction will depend on
 --   When an effect is missing, the SDK rolls the attempt back (nothing is
 --   held: no transaction, no lock, no connection) and, outside any
 --   transaction:
---     txn.prepare_effects(...)            claims owned rows (all or nothing,
---                                         version-checked) and records intents
+--     txn.prepare_effects(...)            takes the lease and records intents
 --     <calls the effect>                  in the application process
 --     txn.effect_done(...)                records the result
 --   then runs the function again: effects already done return their
 --   recorded results. The run that reaches the end commits with
---     txn.finish(tx, owner, consumed)     orphaned effects -> compensation,
---                                         owned rows released
+--     txn.finish(tx, owner, consumed)     orphaned effects -> compensation
 --   so every write, the spawned effects and the outcome commit atomically.
 --
 --   txn.spawn(owner, name, id)            an effect that runs iff the surrounding
@@ -30,6 +27,11 @@
 --                                         run right after it by the process owner
 --   txn.enqueue(name, input)              a named transaction that runs in the
 --                                         background iff the surrounding commits
+--
+--   A transaction may hold keys (txn.start, txn.enqueue): transactions
+--   sharing a key run one at a time, like advisory locks that hold nothing
+--   while effects run. All of a transaction's keys are claimed at once or
+--   none: nobody waits holding a key, so there are no deadlocks.
 
 CREATE TABLE txn.meta (
     version integer NOT NULL
@@ -42,6 +44,7 @@ INSERT INTO txn.meta VALUES (1);
 CREATE TABLE txn.transactions (
     id          uuid PRIMARY KEY,
     name        text,                   -- NULL: inline (not resumable by another process)
+    keys        text[],                 -- the keys it runs under (see txn.keys)
     input       jsonb,                  -- named transactions: their input
     status      text NOT NULL DEFAULT 'running'
                 CHECK (status IN ('running', 'committed', 'failed', 'abandoned')),
@@ -56,6 +59,12 @@ CREATE TABLE txn.transactions (
     finished_at timestamptz
 );
 CREATE INDEX transactions_running ON txn.transactions (lease_until) WHERE status = 'running';
+-- keys held by running transactions
+CREATE TABLE txn.keys (
+    key   text PRIMARY KEY,
+    tx_id uuid NOT NULL REFERENCES txn.transactions ON DELETE CASCADE
+);
+CREATE INDEX keys_tx ON txn.keys (tx_id);
 
 CREATE TABLE txn.effects (
     id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -102,20 +111,6 @@ CREATE TABLE txn.effect_attempts (
 );
 CREATE INDEX effect_attempts_effect ON txn.effect_attempts (effect_id);
 
--- rows owned by a running transaction: nobody else may change them
-CREATE TABLE txn.owned_rows (
-    rel    regclass NOT NULL,
-    key    jsonb NOT NULL,
-    tx_id  uuid NOT NULL REFERENCES txn.transactions ON DELETE CASCADE,
-    PRIMARY KEY (rel, key)
-);
-CREATE INDEX owned_rows_tx ON txn.owned_rows (tx_id);
-
-CREATE TABLE txn.guarded_tables (
-    rel         regclass PRIMARY KEY,
-    key_columns text[] NOT NULL
-);
-
 -- processes running SDK workers (for txn.doctor)
 CREATE TABLE txn.workers (
     owner    uuid PRIMARY KEY,
@@ -144,103 +139,11 @@ LANGUAGE sql IMMUTABLE AS $$
     SELECT least(60000, (200 * pg_catalog.power(2, greatest(0, p_attempts - 1)))::integer)
 $$;
 
-CREATE FUNCTION txn._pk(p_rel regclass) RETURNS text[]
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    cols text[];
-BEGIN
-    SELECT pg_catalog.array_agg(a.attname::text ORDER BY pg_catalog.array_position(i.indkey::int2[], a.attnum))
-      INTO cols
-      FROM pg_catalog.pg_index i
-      JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
-     WHERE i.indrelid = p_rel AND i.indisprimary;
-    IF cols IS NULL THEN
-        RAISE EXCEPTION 'pg_txn: table % has no primary key', p_rel USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN cols;
-END $$;
-
--- The canonical key of a row: its primary key columns as a jsonb object, in
--- the columns' own types (so 42 and '42' name the same row of a bigint key).
-CREATE FUNCTION txn._key(p_rel regclass, p_key jsonb) RETURNS jsonb
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-    cols text[] := txn._pk(p_rel);
-    obj jsonb;
-    full_row jsonb;
-BEGIN
-    IF pg_catalog.jsonb_typeof(p_key) = 'object' THEN
-        obj := p_key;
-    ELSIF pg_catalog.cardinality(cols) = 1 THEN
-        obj := pg_catalog.jsonb_build_object(cols[1], p_key);
-    ELSE
-        RAISE EXCEPTION 'pg_txn: % has a composite primary key (%); pass the key as an object', p_rel, cols
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    EXECUTE pg_catalog.format('SELECT pg_catalog.to_jsonb(r) FROM pg_catalog.jsonb_populate_record(NULL::%s, $1) r', p_rel)
-        INTO full_row USING obj;
-    SELECT pg_catalog.jsonb_object_agg(c, full_row -> c) INTO obj FROM pg_catalog.unnest(cols) c;
-    IF EXISTS (SELECT 1 FROM pg_catalog.jsonb_each(obj) e WHERE e.value = 'null'::jsonb) THEN
-        RAISE EXCEPTION 'pg_txn: key % does not name a row of % (primary key: %)', p_key, p_rel, cols
-            USING ERRCODE = 'invalid_parameter_value';
-    END IF;
-    RETURN obj;
-END $$;
-
-CREATE FUNCTION txn._key_predicate(p_cols text[]) RETURNS text
-LANGUAGE sql IMMUTABLE AS $$
-    SELECT pg_catalog.string_agg(pg_catalog.format('t.%I = k.%I', c, c), ' AND ')
-      FROM pg_catalog.unnest(p_cols) c
-$$;
-
--- ---------------------------------------------------------------------------
--- ownership guard: changing a row owned by another running transaction
--- fails at once (55P03), instead of blocking or silently racing
-
-CREATE FUNCTION txn._guard() RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, txn, pg_temp AS $$
-DECLARE
-    cols text[];
-    k jsonb;
-    holder uuid;
-BEGIN
-    SELECT key_columns INTO cols FROM txn.guarded_tables WHERE rel = TG_RELID;
-    IF cols IS NOT NULL THEN
-        SELECT pg_catalog.jsonb_object_agg(c, pg_catalog.to_jsonb(OLD) -> c) INTO k FROM pg_catalog.unnest(cols) c;
-        SELECT tx_id INTO holder FROM txn.owned_rows WHERE rel = TG_RELID AND key = k;
-        IF holder IS NOT NULL AND holder IS DISTINCT FROM txn._current() THEN
-            RAISE EXCEPTION 'pg_txn: % row % is owned by transaction %', TG_RELID::regclass, k, holder
-                USING ERRCODE = 'lock_not_available', DETAIL = 'owner=' || holder::text,
-                      HINT = 'The transaction that owns it is waiting for an external call; retry after it commits.';
-        END IF;
-    END IF;
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
-END $$;
-
--- Installs the guard on a table (done automatically the first time one of
--- its rows is owned; call it in a migration if the application role does
--- not own the table).
-CREATE FUNCTION txn.guard(p_table regclass) RETURNS void
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM txn.guarded_tables WHERE rel = p_table) THEN
-        RETURN;
-    END IF;
-    EXECUTE pg_catalog.format(
-        'CREATE OR REPLACE TRIGGER pg_txn_guard BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION txn._guard()',
-        p_table);
-    INSERT INTO txn.guarded_tables (rel, key_columns) VALUES (p_table, txn._pk(p_table))
-        ON CONFLICT (rel) DO NOTHING;
-END $$;
-
 -- ---------------------------------------------------------------------------
 -- inside an attempt (the application's own transaction)
 
--- Marks this database transaction as a run of logical transaction p_tx: rows
--- it owns become writable here. Fails if another process drives it now.
+-- Marks this database transaction as a run of logical transaction p_tx.
+-- Fails if another process drives it now.
 CREATE FUNCTION txn.attempt(p_tx uuid, p_owner uuid) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -272,27 +175,6 @@ BEGIN
     END IF;
 END $$;
 
--- Reads a row the transaction depends on: returns it with its version. The
--- SDK claims it, version-checked, before the transaction's first effect.
--- Fails with 55P03 if another running transaction owns it.
-CREATE FUNCTION txn.own(p_table regclass, p_key jsonb)
-RETURNS TABLE ("row" jsonb, version text, key jsonb, rel oid)
-LANGUAGE plpgsql AS $$
-DECLARE
-    k jsonb := txn._key(p_table, p_key);
-    holder uuid;
-BEGIN
-    SELECT o.tx_id INTO holder FROM txn.owned_rows o WHERE o.rel = p_table AND o.key = k;
-    IF holder IS NOT NULL AND holder IS DISTINCT FROM txn._current() THEN
-        RAISE EXCEPTION 'pg_txn: % row % is owned by transaction %', p_table, k, holder
-            USING ERRCODE = 'lock_not_available', DETAIL = 'owner=' || holder::text;
-    END IF;
-    RETURN QUERY EXECUTE pg_catalog.format(
-        'SELECT pg_catalog.to_jsonb(t), t.xmin::text, $1, $2 FROM %s t, pg_catalog.jsonb_populate_record(NULL::%s, $1) k WHERE %s',
-        p_table, p_table, txn._key_predicate(txn._pk(p_table)))
-        USING k, p_table::oid;
-END $$;
-
 -- An effect that runs iff the surrounding transaction commits (a built-in
 -- transactional outbox). Its code is a function in the process p_owner
 -- (the SDK passes its own identity), which runs it right after the commit.
@@ -313,22 +195,23 @@ END $$;
 
 -- A named transaction that runs in the background (on any process that
 -- defines it) iff the surrounding transaction commits.
-CREATE FUNCTION txn.enqueue(p_name text, p_input jsonb DEFAULT '{}', p_id uuid DEFAULT NULL)
+CREATE FUNCTION txn.enqueue(p_name text, p_input jsonb DEFAULT '{}', p_id uuid DEFAULT NULL,
+                            p_keys text[] DEFAULT NULL)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE
     id uuid := coalesce(p_id, pg_catalog.gen_random_uuid());
 BEGIN
-    INSERT INTO txn.transactions (id, name, input, owner, lease_until)
-    VALUES (id, p_name, coalesce(p_input, '{}'), NULL, txn._now())
+    INSERT INTO txn.transactions (id, name, input, keys, owner, lease_until)
+    VALUES (id, p_name, coalesce(p_input, '{}'), p_keys, NULL, txn._now())
     ON CONFLICT ON CONSTRAINT transactions_pkey DO NOTHING;
     PERFORM pg_catalog.pg_notify('txn_effects', p_name);
     RETURN id;
 END $$;
 
 -- Final step of the run that commits: effects recorded for this transaction
--- but not used by this run are orphaned (their compensations are scheduled),
--- owned rows are released, and the outcome is stored, atomically with the
--- run's own writes.
+-- but not used by this run are orphaned (their compensations are scheduled)
+-- and the outcome is stored (releasing its keys), atomically with the run's
+-- own writes.
 CREATE FUNCTION txn.finish(p_tx uuid, p_owner uuid, p_consumed uuid[], p_output jsonb DEFAULT NULL)
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE
@@ -344,7 +227,7 @@ BEGIN
             USING ERRCODE = 'lock_not_available', DETAIL = 'fenced';
     END IF;
     n := txn._orphan(p_tx, p_consumed, NULL);
-    DELETE FROM txn.owned_rows WHERE tx_id = p_tx;
+    DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
        SET status = 'committed', output = p_output, owner = NULL, lease_until = NULL,
            updated_at = txn._now(), finished_at = txn._now()
@@ -388,28 +271,23 @@ END $$;
 -- ---------------------------------------------------------------------------
 -- outside any transaction (autocommit), around the external calls
 
--- Takes (or keeps) the lease on the transaction, claims the rows it owns --
--- all or nothing, each unchanged since it was read -- and records the
--- intents of the effects it is about to call. Returns what to do per effect:
---   {"conflict": {...}}          nothing claimed or recorded: re-run later
+-- Takes (or keeps) the lease on the transaction and records the intents of
+-- the effects it is about to call. Returns what to do per effect:
+--   {"conflict": {"reason": "fenced"}}   another process drives it now: stop
 --   {"effects": [{"seq", "id", "action": execute|wait|done, "attempt", "wait_ms"}]}
 CREATE FUNCTION txn.prepare_effects(p_tx uuid, p_owner uuid, p_lease_ms integer,
-                                    p_effects jsonb, p_claims jsonb DEFAULT '[]',
-                                    p_name text DEFAULT NULL, p_input jsonb DEFAULT NULL)
+                                    p_effects jsonb)
 RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE
     t txn.transactions;
-    c record;
-    cur text;
-    holder uuid;
     e jsonb;
     er txn.effects;
     res jsonb := '[]';
     action text;
     wait_ms integer;
 BEGIN
-    INSERT INTO txn.transactions AS x (id, name, input, owner, generation, lease_until)
-    VALUES (p_tx, p_name, p_input, p_owner, 1, txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    INSERT INTO txn.transactions AS x (id, owner, generation, lease_until)
+    VALUES (p_tx, p_owner, 1, txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
     ON CONFLICT (id) DO UPDATE
        SET owner = p_owner,
            generation = x.generation + CASE WHEN x.owner IS DISTINCT FROM p_owner THEN 1 ELSE 0 END,
@@ -419,47 +297,6 @@ BEGIN
     IF NOT FOUND THEN
         RETURN pg_catalog.jsonb_build_object('conflict', pg_catalog.jsonb_build_object('reason', 'fenced'));
     END IF;
-
-    -- claims: lock the rows briefly in a fixed order, check each is unchanged
-    -- since the run read it and not owned by another transaction; only if all
-    -- pass, record them (no one waits while holding anything: no deadlocks).
-    -- The ownership check comes after the row lock: a claim racing this one
-    -- either committed before the lock was granted (and is visible now) or
-    -- waits for this transaction.
-    FOR c IN
-        -- tables by oid (txn.own returns it): names would resolve in this function's search_path
-        SELECT (x->>'rel')::oid::regclass AS rel, x->'key' AS key, x->>'version' AS version
-          FROM pg_catalog.jsonb_array_elements(coalesce(p_claims, '[]')) x
-         ORDER BY (x->>'rel')::oid, (x->'key')::text
-    LOOP
-        EXECUTE pg_catalog.format(
-            'SELECT t.xmin::text FROM %s t, pg_catalog.jsonb_populate_record(NULL::%s, $1) k WHERE %s FOR UPDATE OF t',
-            c.rel, c.rel, txn._key_predicate(txn._pk(c.rel)))
-            INTO cur USING c.key;
-        IF cur IS DISTINCT FROM c.version THEN
-            RETURN pg_catalog.jsonb_build_object('conflict', pg_catalog.jsonb_build_object(
-                'reason', CASE WHEN cur IS NULL THEN 'gone' ELSE 'changed' END, 'table', c.rel::text, 'key', c.key));
-        END IF;
-        SELECT o.tx_id INTO holder FROM txn.owned_rows o WHERE o.rel = c.rel AND o.key = c.key;
-        IF holder IS NOT NULL AND holder <> p_tx THEN
-            RETURN pg_catalog.jsonb_build_object('conflict', pg_catalog.jsonb_build_object(
-                'reason', 'owned', 'table', c.rel::text, 'key', c.key, 'owner', holder));
-        END IF;
-    END LOOP;
-    FOR c IN
-        SELECT (x->>'rel')::oid::regclass AS rel, x->'key' AS key
-          FROM pg_catalog.jsonb_array_elements(coalesce(p_claims, '[]')) x
-    LOOP
-        PERFORM txn.guard(c.rel);
-        INSERT INTO txn.owned_rows (rel, key, tx_id) VALUES (c.rel, c.key, p_tx)
-            ON CONFLICT (rel, key) DO NOTHING;
-        SELECT o.tx_id INTO holder FROM txn.owned_rows o WHERE o.rel = c.rel AND o.key = c.key;
-        IF holder IS DISTINCT FROM p_tx THEN
-            -- lost a race after all: undo this call's claims and intents
-            RAISE EXCEPTION USING ERRCODE = 'lock_not_available', MESSAGE = 'pg_txn claim race',
-                  DETAIL = 'owner=' || holder::text;
-        END IF;
-    END LOOP;
 
     FOR e IN SELECT * FROM pg_catalog.jsonb_array_elements(coalesce(p_effects, '[]')) LOOP
         INSERT INTO txn.effects (tx_id, kind, seq, name, input, input_hash, max_attempts, delivery, compensation)
@@ -564,7 +401,7 @@ LANGUAGE sql AS $$
 $$;
 
 -- The transaction failed (the function threw): its effects are orphaned and
--- compensated, its rows released.
+-- compensated.
 CREATE FUNCTION txn.fail_transaction(p_tx uuid, p_owner uuid, p_error jsonb) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -573,7 +410,7 @@ BEGIN
         RETURN false;
     END IF;
     PERFORM txn._orphan(p_tx, '{}', NULL);
-    DELETE FROM txn.owned_rows WHERE tx_id = p_tx;
+    DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
        SET status = 'failed', error = p_error, owner = NULL, lease_until = NULL,
            updated_at = txn._now(), finished_at = txn._now()
@@ -582,14 +419,74 @@ BEGIN
     RETURN true;
 END $$;
 
--- Starts a named transaction driven by this process (resumable by any
--- process that defines it if this one stops).
-CREATE FUNCTION txn.start(p_tx uuid, p_name text, p_input jsonb, p_owner uuid, p_lease_ms integer) RETURNS timestamptz
-LANGUAGE sql AS $$
-    INSERT INTO txn.transactions (id, name, input, owner, generation, lease_until)
-    VALUES (p_tx, p_name, p_input, p_owner, 1, txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
-    RETURNING created_at
-$$;
+-- Claims all of p_keys for p_tx, or none: returns NULL when they are held
+-- (already by p_tx included), or the transaction holding one of them.
+-- Claims of a key are serialized by a transaction-level advisory lock on it
+-- (in pg_txn's own lock space), taken for every key in sorted order before
+-- any insert: p_wait false (background leasing) never waits for one and
+-- returns the all-zero uuid when a key is being claimed right now, so no
+-- two claims ever wait for each other in a cycle.
+CREATE FUNCTION txn._claim(p_tx uuid, p_keys text[], p_wait boolean DEFAULT true) RETURNS uuid
+LANGUAGE plpgsql AS $$
+DECLARE
+    k text;
+    holder uuid;
+    ks text[] := ARRAY(SELECT DISTINCT x FROM pg_catalog.unnest(p_keys) x ORDER BY x);
+BEGIN
+    FOREACH k IN ARRAY ks LOOP
+        IF p_wait THEN
+            PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('pg_txn keys'), pg_catalog.hashtext(k));
+        ELSIF NOT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtext('pg_txn keys'), pg_catalog.hashtext(k)) THEN
+            RETURN '00000000-0000-0000-0000-000000000000';
+        END IF;
+    END LOOP;
+    <<again>>
+    LOOP
+        FOREACH k IN ARRAY ks LOOP
+            INSERT INTO txn.keys (key, tx_id) VALUES (k, p_tx) ON CONFLICT (key) DO NOTHING;
+            IF NOT FOUND THEN
+                SELECT h.tx_id INTO holder FROM txn.keys h WHERE h.key = k;
+                IF holder IS NULL THEN
+                    -- released meanwhile: start over
+                    DELETE FROM txn.keys WHERE tx_id = p_tx AND key = ANY (ks);
+                    CONTINUE again;
+                END IF;
+                IF holder <> p_tx THEN
+                    DELETE FROM txn.keys WHERE tx_id = p_tx AND key = ANY (ks);
+                    RETURN holder;
+                END IF;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END LOOP;
+END $$;
+
+-- Starts a transaction driven by this process: a named one (resumable by
+-- any process that defines it if this one stops), or an inline one with
+-- keys. If another transaction holds one of the keys, nothing is started and
+-- holder is that transaction: wait for it to end, then start again.
+CREATE FUNCTION txn.start(p_tx uuid, p_name text, p_input jsonb, p_owner uuid, p_lease_ms integer,
+                          p_keys text[] DEFAULT NULL)
+RETURNS TABLE (created_at timestamptz, holder uuid)
+LANGUAGE plpgsql AS $$
+DECLARE
+    t txn.transactions;
+    h uuid;
+BEGIN
+    INSERT INTO txn.transactions (id, name, input, keys, owner, generation, lease_until)
+    VALUES (p_tx, p_name, p_input, p_keys, p_owner, 1,
+            txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    RETURNING * INTO t;
+    IF p_keys IS NOT NULL THEN
+        h := txn._claim(p_tx, p_keys);
+        IF h IS NOT NULL THEN
+            DELETE FROM txn.transactions x WHERE x.id = p_tx;
+            RETURN QUERY SELECT NULL::timestamptz, h;
+            RETURN;
+        END IF;
+    END IF;
+    RETURN QUERY SELECT t.created_at, NULL::uuid;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- SDK workers: spawned effects, compensations, background and resumed
@@ -759,28 +656,36 @@ CREATE FUNCTION txn.lease_transactions(p_owner uuid, p_names text[], p_max integ
                                        p_lease_ms integer DEFAULT 30000)
 RETURNS TABLE (id uuid, name text, input jsonb, runs integer, created_at timestamptz)
 LANGUAGE plpgsql AS $$
+DECLARE
+    c record;
+    n integer := 0;
 BEGIN
-    RETURN QUERY
-    WITH due AS (
-        SELECT t.id FROM txn.transactions t
+    FOR c IN
+        SELECT t.id, t.keys FROM txn.transactions t
          WHERE t.status = 'running' AND t.name = ANY (p_names)
            AND (t.owner IS NULL OR t.lease_until < txn._now())
            -- a live process keeps driving its own transactions
            AND t.owner IS DISTINCT FROM p_owner
          ORDER BY t.created_at
-         LIMIT p_max
+         LIMIT p_max * 4
          FOR UPDATE SKIP LOCKED
-    )
-    UPDATE txn.transactions t
-       SET owner = p_owner, generation = t.generation + 1, updated_at = txn._now(),
-           lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0)
-      FROM due WHERE t.id = due.id
-    RETURNING t.id, t.name, t.input, t.runs, t.created_at;
+    LOOP
+        EXIT WHEN n >= p_max;
+        -- queued under keys another transaction holds: its turn comes later
+        CONTINUE WHEN c.keys IS NOT NULL AND txn._claim(c.id, c.keys, false) IS NOT NULL;
+        RETURN QUERY
+        UPDATE txn.transactions t
+           SET owner = p_owner, generation = t.generation + 1, updated_at = txn._now(),
+               lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0)
+         WHERE t.id = c.id
+        RETURNING t.id, t.name, t.input, t.runs, t.created_at;
+        n := n + 1;
+    END LOOP;
 END $$;
 
 -- Inline (unnamed) transactions whose process stopped cannot be resumed:
--- they are abandoned, their effects orphaned and compensated, their rows
--- released.
+-- they are abandoned (releasing their keys), their effects orphaned and
+-- compensated.
 CREATE FUNCTION txn.abandon_expired(p_grace_ms integer DEFAULT 5000) RETURNS integer
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -799,7 +704,7 @@ BEGIN
                        'message', 'the process running this transaction stopped')
          WHERE tx_id = t.id AND kind = 'call' AND status IN ('pending', 'running', 'retry_wait');
         PERFORM txn._orphan(t.id, '{}', NULL);
-        DELETE FROM txn.owned_rows WHERE tx_id = t.id;
+        DELETE FROM txn.keys WHERE tx_id = t.id;
         UPDATE txn.transactions
            SET status = 'abandoned', owner = NULL, lease_until = NULL, updated_at = txn._now(),
                finished_at = txn._now(),
@@ -829,12 +734,8 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 CREATE VIEW txn.running_transactions AS
-    SELECT id, name, owner, runs, lease_until, created_at, clock_timestamp() - created_at AS age
+    SELECT id, name, keys, owner, runs, lease_until, created_at, clock_timestamp() - created_at AS age
       FROM txn.transactions WHERE status = 'running';
-
-CREATE VIEW txn.owned AS
-    SELECT o.rel AS "table", o.key, o.tx_id, t.name, t.created_at
-      FROM txn.owned_rows o JOIN txn.transactions t ON t.id = o.tx_id;
 
 CREATE VIEW txn.effect_errors AS
     SELECT a.effect_id, e.tx_id, e.kind, e.name, a.attempt, a.outcome, a.error,
@@ -937,7 +838,6 @@ DECLARE
 BEGIN
     FOR f IN SELECT p.oid::regprocedure FROM pg_catalog.pg_proc p
               WHERE p.pronamespace = 'txn'::regnamespace AND p.prokind = 'f'
-                AND p.oid::regprocedure::text <> 'txn._guard()'
     LOOP
         EXECUTE pg_catalog.format('ALTER FUNCTION %s SET search_path = pg_catalog, txn, pg_temp', f);
     END LOOP;

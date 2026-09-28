@@ -20,7 +20,6 @@ async function charge(input: { orderId: number }, key: string) {
 }
 
 async function pay(tx: any, input: { orderId: number }) {
-  await tx.own("orders", input.orderId);
   const p = await tx.effect(async (ctx: any) => {
     const r = await charge(input, ctx.idempotencyKey);
     send({ charged: ctx.effectId });
@@ -30,7 +29,7 @@ async function pay(tx: any, input: { orderId: number }) {
       while (Date.now() < until) {}
     }
     return r;
-  }, { name: "charge", key: input, retry: true, compensate: async () => {} });
+  }, { name: "charge", deps: input, retry: true, compensate: async () => {} });
   if (cfg.mode === "hang-before-commit" || cfg.mode === "inline-hang") {
     send({ beforeCommit: true });
     await forever();

@@ -30,13 +30,15 @@ export class EffectFailedError extends Error {
   }
 }
 
-/** A row the transaction wants is owned by another transaction for longer than it waits. */
-export class OwnershipTimeoutError extends Error {
-  owner: string;
-  constructor(owner: string, waitedMs: number) {
-    super(`a row this transaction needs is still owned by transaction ${owner} after ${waitedMs} ms`);
-    this.name = "OwnershipTimeoutError";
-    this.owner = owner;
+/** Another transaction held the key for longer than this one waits (keyWaitMs). */
+export class KeyTimeoutError extends Error {
+  key: string;
+  holder: string;
+  constructor(key: string, holder: string, waitedMs: number) {
+    super(`key ${key} is still held by transaction ${holder} after ${waitedMs} ms`);
+    this.name = "KeyTimeoutError";
+    this.key = key;
+    this.holder = holder;
   }
 }
 

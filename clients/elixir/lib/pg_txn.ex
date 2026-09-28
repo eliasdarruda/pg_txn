@@ -3,19 +3,18 @@ defmodule PgTxn do
   pg_txn for Ecto: database transactions that include side effects.
 
       PgTxn.transaction(Repo, fn tx ->
-        # protected until commit
-        order = PgTxn.own(tx, "orders", id)
+        order = Repo.get!(Order, id)
 
         # no lock or connection held while it runs
         payment =
-          PgTxn.effect(tx, fn ctx -> Payments.charge(order, ctx.idempotency_key) end,
-            name: "charge", key: order["amount"])
+          PgTxn.effect(tx, fn ctx -> Payments.charge(order.amount, ctx.idempotency_key) end,
+            name: "charge", deps: order.amount)
 
-        Repo.query!("UPDATE orders SET status = 'paid', payment = $2 WHERE id = $1", [id, payment["id"]])
+        Repo.update_all(from(o in Order, where: o.id == ^id), set: [status: "paid", payment_id: payment["id"]])
 
         # runs iff this commits
         PgTxn.spawn(tx, fn -> Mailer.send_receipt(id) end)
-      end)
+      end, key: {"order", id})  # optional: one at a time per order
 
   The function runs in an ordinary `Repo.transaction/2`, so it uses the Repo
   as usual (queries, schemas, changesets). When it reaches an effect that has
@@ -57,13 +56,25 @@ defmodule PgTxn do
   (like `Repo.transaction/2`). Either way the failure is recorded
   (`txn.fail_transaction`): effects that ran are orphaned and compensated.
 
-  Options: `:id` (the transaction id, default a new uuid), `:lease_ms`, and
-  any `Repo.transaction/2` option (e.g. `:timeout`). Cannot be called inside
-  another Repo transaction.
+  Nothing is locked while effects run: data the function read may change
+  meanwhile, and the next run sees it (return early, or pass it as an
+  effect's `:deps`). With a `:key`, transactions with the same key run one
+  at a time: the others wait (holding nothing) until it ends, for up to
+  `:key_wait_ms` (see `PgTxn.Config`), then raise `PgTxn.KeyTimeoutError`.
+  With `:keys`, all of them are claimed at once or none (no deadlocks), e.g.
+  both accounts of a transfer.
+
+  Options: `:key` (a string, used as is, or any JSON-able term such as
+  `{"order", 42}` or `["order", 42]`, stored as its JSON text
+  `["order",42]`, the same as in the other clients), `:keys` (a list of
+  such keys), `:id` (the transaction
+  id, default a new uuid), `:lease_ms`, and any `Repo.transaction/2` option
+  (e.g. `:timeout`). Cannot be called inside another Repo transaction.
   """
   @spec transaction(repo, (tx -> result), keyword) :: {:ok, result} | {:error, term} when result: term
   def transaction(repo, fun, opts \\ []) when is_function(fun, 1) do
-    Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, DateTime.utc_now(), opts)
+    opts = if Loop.keys(opts), do: Keyword.put(opts, :start, {nil, nil}), else: opts
+    Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, opts)
   end
 
   @doc """
@@ -77,15 +88,14 @@ defmodule PgTxn do
   value (see `PgTxn.DJSON`); maps come back with string keys.
 
   An effect is identified by its position in the transaction and its
-  `:name`. With a `:key` (any durable value, e.g. the data the call is
-  decided on), a re-run that reaches it with a different key is a new
-  effect, and the old one is orphaned (and compensated) when the
-  transaction commits.
+  `:name`. With `:deps` (any durable value: the data the call is decided
+  on), a re-run that reaches it with different deps is a new effect, and
+  the old one is orphaned (and compensated) when the transaction commits.
 
   Options:
 
     * `:name` - names the effect in `txn.effects` and for reuse (default `"effect"`)
-    * `:key` - see above (default `nil`: reuse by position and name only)
+    * `:deps` - see above (default `nil`: reuse by position and name only)
     * `:retry` - off by default: `fun` is called at most once, and an
       error, a timeout or a crash mid-call fails the effect. Turn it on only
       when `fun` is safe to call again (e.g. it passes `ctx.idempotency_key`
@@ -113,21 +123,6 @@ defmodule PgTxn do
 
     Tx.effect(tx, fun, opts)
   end
-
-  @doc """
-  Reads a row and protects it until the transaction commits: nobody else can
-  change it meanwhile (they get a `Postgrex.Error` with code
-  `:lock_not_available` at once), and effects only run if it did not change
-  since it was read. Another transaction owning the same row waits for this
-  one.
-
-  `table` is a table name (`"orders"`, `"shop.orders"`) or an Ecto schema
-  module; `key` is the primary key value, or a map of its columns. Returns
-  the row as a map with string keys (its `jsonb` form), or `nil`. Call it
-  before the transaction's first effect.
-  """
-  @spec own(tx, String.t() | module, term) :: map | nil
-  def own(%Tx{} = tx, table, key), do: Tx.own(tx, table, key)
 
   @doc "When the transaction started: the same in every run."
   @spec now(tx) :: DateTime.t()
@@ -206,7 +201,8 @@ defmodule PgTxn do
   Queues the named transaction `name` (see `define/3`) to run in the
   background on any node that defines it, iff the surrounding transaction
   commits (like `spawn/3`: pass a `tx` or a Repo). Returns its id, for
-  `wait/3`. Option: `:id`.
+  `wait/3`. Options: `:id`, `:key` and `:keys` (as in `transaction/3`: it
+  starts only when no other transaction holds any of them).
   """
   @spec enqueue(tx | repo, String.t() | atom, term, keyword) :: String.t()
   def enqueue(tx_or_repo, name, input \\ %{}, opts \\ []) do
@@ -214,8 +210,8 @@ defmodule PgTxn do
     unless match?(%Tx{}, tx_or_repo), do: Schema.ensure!(repo)
 
     id =
-      SQL.value(repo, "SELECT txn.enqueue($1, $2::text::jsonb, $3::text::uuid)::text",
-        [to_string(name), DJSON.encode!(input), opts[:id]])
+      SQL.value(repo, "SELECT txn.enqueue($1, $2::text::jsonb, $3::text::uuid, $4::text[])::text",
+        [to_string(name), DJSON.encode!(input), opts[:id], Loop.keys(opts)])
 
     case tx_or_repo do
       %Tx{} = tx -> Tx.mark_spawned(tx)
@@ -243,25 +239,18 @@ defmodule PgTxn do
   @doc """
   Runs the named transaction `name` now, in this process (resumable by any
   node that defines it if this one stops). Returns like `transaction/3`; its
-  output must be a durable value. Options: `:id`, `:lease_ms`.
+  output must be a durable value. Options: `:id`, `:key` and `:keys` (as in
+  `transaction/3`), `:lease_ms`.
   """
   @spec run(repo, String.t() | atom, term, keyword) :: {:ok, term} | {:error, term}
   def run(repo, name, input, opts \\ []) do
     name = to_string(name)
     fun = Registry.definition(repo, name) || raise ArgumentError, "pg_txn: no transaction named #{name} is defined for #{inspect(repo)}"
-    Schema.ensure!(repo)
     id = opts[:id] || Ecto.UUID.generate()
-    lease_ms = opts[:lease_ms] || Config.get(repo, :lease_ms)
     encoded = DJSON.encode!(input)
-    owner = Ecto.UUID.generate()
-
-    # its created_at: now/1 of the first run and of resumed ones agree
-    started_at =
-      SQL.value(repo, "SELECT txn.start($1::text::uuid, $2, $3::text::jsonb, $4::text::uuid, $5)",
-        [id, name, encoded, owner, lease_ms])
-
     stored = DJSON.decode!(encoded)
-    Loop.drive(repo, id, fn tx -> fun.(tx, stored) end, started_at, Keyword.merge(opts, id: id, named: true, owner: owner))
+    # txn.start records its created_at: now/1 of the first run and of resumed ones agree
+    Loop.drive(repo, id, fn tx -> fun.(tx, stored) end, Keyword.merge(opts, named: true, start: {name, encoded}))
   end
 
   @doc """

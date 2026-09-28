@@ -2,8 +2,8 @@
 // is the dependency and `new PgTxn(pool)`: this replica's worker runs its share
 // of the transactions and effects, and resumes transactions of replicas that
 // stop. Each replica enqueues JOBS "bump" transactions on the shared counters
-// 1..ACTORS: own the counter, call the receiver (the external API), write the
-// new value back.
+// 1..ACTORS, one at a time per counter (a key): read the counter, call the
+// receiver (the external API), write the new value back.
 import os from "node:os";
 import pg from "pg";
 import { PgTxn } from "@pg-txn/client";
@@ -20,7 +20,7 @@ const receiver = env("RECEIVER_URL");
 const pgtxn = new PgTxn(pool, { leaseMs: 3000 });
 
 pgtxn.define("bump", async (tx, input: { counter: number }) => {
-  const c = await tx.own<{ n: number }>("counters", input.counter);
+  const [c] = (await tx.db.query("SELECT n FROM counters WHERE id = $1", [input.counter])).rows;
   const receipt = await tx.effect(async (ctx) => {
     const res = await fetch(`${receiver}/tick`, {
       method: "POST", headers: { "idempotency-key": ctx.idempotencyKey }, body: String(c!.n + 1),
@@ -43,7 +43,8 @@ console.log(`replica ${os.hostname()} worker ${pgtxn.owner} started`);
 const jobs = Number(env("JOBS"));
 const actors = Number(env("ACTORS"));
 for (let i = 0; i < jobs; i++) {
-  await pgtxn.enqueue("bump", { counter: 1 + ((i * 7 + os.hostname().length) % actors) });
+  const counter = 1 + ((i * 7 + os.hostname().length) % actors);
+  await pgtxn.enqueue("bump", { counter }, { key: ["counter", counter] });
 }
 console.log(`replica ${os.hostname()} enqueued ${jobs}`);
 // keep serving: the worker runs transactions for every replica

@@ -11,9 +11,10 @@ the contract every SDK implements; the TypeScript client
 
 The schema is installed by `CREATE EXTENSION pg_txn` (self-managed
 PostgreSQL, or pg_tle), by running the file as a migration, or by an SDK on
-first use: if `to_regclass('txn.meta')` is NULL, run `CREATE SCHEMA txn;` +
-the file in one transaction after `pg_advisory_xact_lock(hashtext('pg_txn install'))`
-(re-check after taking the lock). Then check `SELECT version FROM txn.meta`
+first use: if `txn.meta` does not exist, run `CREATE SCHEMA txn;` + the file
+in one transaction after `pg_advisory_xact_lock(hashtext('pg_txn install'))`,
+re-checking after taking the lock with a catalog scan (`pg_class` joined to
+`pg_namespace`), not `to_regclass`, whose cache may be stale after the wait. Then check `SELECT version FROM txn.meta`
 against the version the SDK was built for. PostgreSQL 14+, no superuser,
 no preloaded library.
 
@@ -21,44 +22,61 @@ no preloaded library.
 
 Inputs, results and outputs are `jsonb`. SDKs may encode richer values
 (the TypeScript and Elixir clients tag bigint, dates and bytes as
-`{"$bigint": "..."}`, etc.). Effect keys are hashed **in SQL** from their
-`jsonb` form (`txn._hash(name, key)`), so memoization never depends on a
-client's JSON printer.
+`{"$bigint": "..."}`, etc.). Effect deps are hashed **in SQL** from their
+`jsonb` form (`txn._hash(name, deps)`), so memoization never depends on a
+client's JSON printer. Transaction keys are text: a string as is, anything
+else as its JSON text.
 
 ## A transaction
 
 ```
-tx_id := new uuid; owner := this process's uuid; claimed := false
+tx_id := new uuid; owner := this process's uuid
+if keys:                                           -- optional: run one at a time per key
+  loop:
+    (created_at, holder) := SELECT * FROM txn.start(tx_id, NULL, NULL, owner, lease_ms, keys)
+    holder is NULL → break                         -- all keys claimed at once
+    wait until txn.status(holder) is not 'running' (up to key_wait_ms), loop
 loop:
-  run := { seq: 0, needs: [], consumed: [], claims: [], effect_called: false }
+  run := { seq: 0, needs: [], consumed: [] }
   BEGIN                                            -- the application's own transaction
     SELECT txn.attempt(tx_id, owner)               -- marks the session; fenced check
-    result := user_function(tx)                    -- tx.effect / tx.own / tx.spawn below
+    result := user_function(tx)                    -- tx.effect / tx.spawn below
     if run.needs not empty: ROLLBACK, goto perform
-    SELECT txn.finish(tx_id, owner, run.consumed, output)
+    SELECT txn.finish(tx_id, owner, run.consumed, output)   -- releases the keys
   COMMIT → return result
   on error:
     run.needs not empty          → perform
-    55P03, DETAIL 'owner=<uuid>' → wait until txn.status(<uuid>) is not 'running', loop
     55P03, DETAIL 'fenced'       → another process drives this transaction: stop
     40001 / 40P01                → loop (with backoff)
     otherwise                    → SELECT txn.fail_transaction(tx_id, owner, error); rethrow
 ```
 
+Keys are cooperative, like advisory locks: they order pg_txn transactions
+that share one; other writers are not blocked. `txn.start` claims all of a
+transaction's keys or none, in sorted order, so nobody waits while holding a
+key and there are no deadlocks.
+
+Without keys, concurrency is optimistic: every run re-reads the data, so
+the committing run writes on current data; if data changed while an effect
+ran, the re-run either takes another path (the effect is then unused, and
+compensated) or calls the effect with different `deps` (a new effect; the
+old one is compensated).
+
 ### tx.effect(fn, options)
 
 `fn` runs outside any database transaction and receives a context (effect
 id = idempotency key, attempt, abort signal). `options.name` (default: the
-function's name, else `"effect"`) labels it; `options.key` (default `null`)
-is JSON describing what it does: a re-run reuses the recorded result only if
-it reaches the effect at the same position with the same name and key.
+function's name, else `"effect"`) labels it; `options.deps` (default `null`)
+is JSON of the data the call depends on: a re-run reuses the recorded result
+only if it reaches the effect at the same position with the same name and
+deps.
 
 ```
-run.effect_called := true; seq := run.seq++
-SELECT effect_id, status, result, error FROM txn.effect_lookup(tx_id, seq, name, key)
+seq := run.seq++
+SELECT effect_id, status, result, error FROM txn.effect_lookup(tx_id, seq, name, deps)
   'succeeded' → run.consumed += effect_id; return result
   'failed'    → run.consumed += effect_id; raise EffectFailed(error) in user code
-  otherwise   → run.needs += {seq, name, key, fn, options}; abort the run
+  otherwise   → run.needs += {seq, name, deps, fn, options}; abort the run
 ```
 
 Effects started concurrently in one run (e.g. `Promise.all`) should all be
@@ -66,32 +84,13 @@ registered before the run aborts, so they are performed in one round.
 Once a run has registered a need it must roll back even if user code
 catches the abort.
 
-### tx.own(table, key)
-
-Only before the run's first `tx.effect` (otherwise an error).
-
-```
-SELECT "row", version, key, rel FROM txn.own(table::regclass, key)
-  → 55P03 'owner=<uuid>' if another running transaction owns it (handled by the loop)
-  no row → return null
-  if not claimed: run.claims += {rel, key, version}
-  return row
-```
-
-`rel` is the table's oid: pass it back as is (names would be resolved in
-the schema functions' own `search_path`).
-
 ### perform (outside any transaction)
 
 ```
 heartbeat every lease/3: SELECT txn.heartbeat(tx_id, owner, lease_ms)
-r := SELECT txn.prepare_effects(tx_id, owner, lease_ms, effects, claims)
-     effects: [{seq, name, input: key, max_attempts, delivery, compensation}]
-     claims:  run.claims, only while not claimed
-  r.conflict.reason 'owned'           → wait for r.conflict.owner; loop
-  r.conflict.reason 'changed' | 'gone' → loop (re-run on fresh data)
-  r.conflict.reason 'fenced'          → stop
-claimed := true
+r := SELECT txn.prepare_effects(tx_id, owner, lease_ms, effects)
+     effects: [{seq, name, input: deps, max_attempts, delivery, compensation}]
+  r.conflict (fenced) → stop
 for each r.effects[i] (concurrently):
   'done'    → nothing
   'wait'    → sleep wait_ms, prepare this effect again
@@ -106,11 +105,7 @@ Retries are opt-in: clients send `max_attempts` 1 and delivery
 n and `at-least-once`. Retryable: with retries on, any error except an
 explicit permanent one (an explicit retryable error may set the delay);
 with retries off, nothing. Compensations get the policy of the effect they
-undo. `prepare_effects`
-claims every row all-or-nothing, each locked briefly in a fixed order and
-checked unchanged (`xmin`) since the run read it: an effect only runs if the
-data it was decided on is still current, and nobody waits while holding
-anything (no deadlocks). A `running` effect found by a new driver (the
+undo. A `running` effect found by a new driver (the
 previous process stopped mid-call) is re-run (`at-least-once`) or failed as
 `AmbiguousEffectOutcome` (`at-most-once`).
 
@@ -120,8 +115,8 @@ Inside the committing run. Effects recorded for the transaction that this
 run did not consume become `orphaned`; a succeeded orphan with a
 `compensation` (a label; the function is the client's) gets a
 `compensation` effect owned by the process driving the transaction
-(`local_owner`), which has the function. Owned rows are released
-and the outcome is stored, all in the application's commit.
+(`local_owner`), which has the function. The keys are released and the
+outcome is stored, all in the application's commit.
 
 ## Spawned effects and background transactions
 
@@ -129,10 +124,12 @@ and the outcome is stored, all in the application's commit.
   transaction: the effect exists iff it commits (a transactional outbox).
   Its code is a function the client keeps in memory under `id`; only the
   process `owner` runs it (`name` is a label).
-- `txn.enqueue(name, input, id)`: a named transaction that runs in the
-  background iff the surrounding transaction commits.
-- Named transactions started in-process: `txn.start(tx_id, name, input, owner, lease_ms)`,
-  then the loop above. If the process stops, the lease expires.
+- `txn.enqueue(name, input, id, keys)`: a named transaction that runs in the
+  background iff the surrounding transaction commits; with keys, when none
+  of them is held (`lease_transactions` claims them).
+- Named transactions started in-process: `txn.start(tx_id, name, input, owner, lease_ms, keys)`,
+  then the loop above. If the process stops, the lease expires; the process
+  that resumes it keeps its keys.
 
 A worker (one per process, polling, woken by `NOTIFY txn_effects`):
 
@@ -159,6 +156,5 @@ functions of a run that rolled back, and of effects no longer pending.
 
 | SQLSTATE | DETAIL | meaning |
 |---|---|---|
-| `55P03` | `owner=<uuid>` | a row is owned by another running transaction |
 | `55P03` | `fenced` | another process drives this transaction now |
 | `40001`, `40P01` | | serialization failure / deadlock in a run: run again |

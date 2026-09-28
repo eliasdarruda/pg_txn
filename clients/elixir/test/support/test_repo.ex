@@ -20,3 +20,10 @@ defmodule PgTxn.DrainRepo do
   use Ecto.Repo, otp_app: :pg_txn, adapter: Ecto.Adapters.Postgres
   use PgTxn.Repo, poll_ms: 20
 end
+
+defmodule PgTxn.ImpatientRepo do
+  @moduledoc false
+  # started by a test: waits 200 ms at most for a key
+  use Ecto.Repo, otp_app: :pg_txn, adapter: Ecto.Adapters.Postgres
+  use PgTxn.Repo, key_wait_ms: 200
+end

@@ -4,28 +4,27 @@ defmodule PgTxn.Tx do
 
   `:id` is the logical transaction id (the same in every run) and `:repo` the
   Repo whose transaction the run is in. The run's bookkeeping (effect
-  sequence, needed and consumed effects, claimed rows) lives in the process
-  dictionary of the process running it: call `PgTxn.effect/3`, `PgTxn.own/3`
-  and friends from that process, like any Repo call inside a transaction.
+  sequence, needed and consumed effects, spawns) lives in the process
+  dictionary of the process running it: call `PgTxn.effect/3`,
+  `PgTxn.spawn/3` and friends from that process, like any Repo call inside a transaction.
   """
   alias PgTxn.{DJSON, EffectFailedError, Local, NeedEffect, SQL}
 
   @enforce_keys [:repo, :id, :owner, :started_at, :ref]
-  defstruct [:repo, :id, :owner, :started_at, :ref, claimed: false]
+  defstruct [:repo, :id, :owner, :started_at, :ref]
 
   @type t :: %__MODULE__{
           repo: module,
           id: String.t(),
           owner: String.t(),
           started_at: DateTime.t(),
-          ref: reference,
-          claimed: boolean
+          ref: reference
         }
 
   @doc false
-  def new(repo, id, owner, started_at, claimed) do
-    tx = %__MODULE__{repo: repo, id: id, owner: owner, started_at: started_at, ref: make_ref(), claimed: claimed}
-    Process.put(key(tx), %{seq: 0, needs: [], consumed: [], claims: [], effect_called: false, spawned: false, spawn_ids: [], uuids: 0})
+  def new(repo, id, owner, started_at) do
+    tx = %__MODULE__{repo: repo, id: id, owner: owner, started_at: started_at, ref: make_ref()}
+    Process.put(key(tx), %{seq: 0, needs: [], consumed: [], spawned: false, spawn_ids: [], uuids: 0})
     tx
   end
 
@@ -40,9 +39,9 @@ defmodule PgTxn.Tx do
   def effect(tx, fun, opts) do
     state = state!(tx)
     seq = state.seq
-    put(tx, %{state | seq: seq + 1, effect_called: true})
+    put(tx, %{state | seq: seq + 1})
     name = to_string(Keyword.get(opts, :name, "effect"))
-    tagged = DJSON.to_tagged(Keyword.get(opts, :key))
+    tagged = DJSON.to_tagged(Keyword.get(opts, :deps))
 
     row =
       SQL.one(tx.repo, "SELECT effect_id::text AS effect_id, status, result, error FROM txn.effect_lookup($1::text::uuid, $2, $3, $4::text::jsonb)",
@@ -62,27 +61,6 @@ defmodule PgTxn.Tx do
         need = %{seq: seq, name: name, tagged: tagged, fun: fun, opts: opts}
         update(tx, &%{&1 | needs: &1.needs ++ [need]})
         raise NeedEffect
-    end
-  end
-
-  @doc false
-  def own(tx, table, key) do
-    if state!(tx).effect_called do
-      raise ArgumentError,
-            "pg_txn: own(#{inspect(table)}) after an effect: own the rows a transaction depends on before its first effect"
-    end
-
-    row =
-      SQL.one(tx.repo, ~s{SELECT "row", version, key, rel::bigint AS rel FROM txn.own($1::text::regclass, $2::text::jsonb)},
-        [table_name(table), Jason.encode!(key)])
-
-    case row do
-      nil ->
-        nil
-
-      %{"row" => data, "version" => version, "key" => k, "rel" => rel} ->
-        unless tx.claimed, do: update(tx, &%{&1 | claims: &1.claims ++ [%{rel: rel, key: k, version: version}]})
-        data
     end
   end
 
@@ -111,19 +89,6 @@ defmodule PgTxn.Tx do
     <<p1::binary-size(8), p2::binary-size(4), p3::binary-size(4), p4::binary-size(4), p5::binary-size(12)>> = h
     Enum.join([p1, p2, p3, p4, p5], "-")
   end
-
-  defp table_name(table) when is_atom(table) do
-    if Code.ensure_loaded?(table) and function_exported?(table, :__schema__, 1) do
-      case table.__schema__(:prefix) do
-        nil -> ~s("#{table.__schema__(:source)}")
-        prefix -> ~s("#{prefix}"."#{table.__schema__(:source)}")
-      end
-    else
-      Atom.to_string(table)
-    end
-  end
-
-  defp table_name(table) when is_binary(table), do: table
 
   defp key(%__MODULE__{ref: ref}), do: {__MODULE__, ref}
 

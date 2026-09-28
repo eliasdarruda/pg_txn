@@ -36,13 +36,16 @@ defmodule PgTxn.FencedError do
   def message(%{tx_id: id}), do: "transaction #{id} is now driven by another process"
 end
 
-defmodule PgTxn.OwnershipTimeoutError do
-  @moduledoc "A row the transaction needs stayed owned by another transaction for longer than `:owner_wait_ms`."
-  defexception [:owner, :waited_ms]
+defmodule PgTxn.KeyTimeoutError do
+  @moduledoc """
+  The transaction's key stayed held by another transaction (`:holder`) for
+  longer than `:key_wait_ms`.
+  """
+  defexception [:key, :holder, :waited_ms]
 
   @impl true
-  def message(%{owner: owner, waited_ms: ms}) do
-    "a row this transaction needs is still owned by transaction #{owner} after #{ms} ms"
+  def message(%{key: key, holder: holder, waited_ms: ms}) do
+    "key #{key} is still held by transaction #{holder} after #{ms} ms"
   end
 end
 

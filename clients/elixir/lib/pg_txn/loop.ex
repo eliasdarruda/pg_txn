@@ -5,31 +5,43 @@ defmodule PgTxn.Loop do
   # of any transaction, record its result, and run again. The run that
   # reaches the end commits.
   require Logger
-  alias PgTxn.{Call, Config, DJSON, FencedError, Local, NeedEffect, OwnershipTimeoutError, Schema, SQL, Tx}
+  alias PgTxn.{Call, Config, DJSON, FencedError, KeyTimeoutError, Local, NeedEffect, Schema, SQL, Tx}
 
-  @own_opts [:id, :lease_ms, :named, :owner]
+  @own_opts [:id, :lease_ms, :named, :owner, :key, :keys, :start, :started_at]
 
   @doc """
   Drives transaction `tx_id` to its end. Returns `{:ok, value}` when it
   commits, `{:error, reason}` when the function called `repo.rollback(reason)`,
   and re-raises whatever the function raised (after recording the failure).
+
+  Options (besides `Repo.transaction/2` ones): `:owner`, `:lease_ms`,
+  `:named`, `:started_at` (of a resumed transaction), or `start: {name,
+  encoded_input}` with `:key`/`:keys` to record it as running first
+  (`txn.start`, waiting for the keys).
   """
-  def drive(repo, tx_id, fun, %DateTime{} = started_at, opts) do
+  def drive(repo, tx_id, fun, opts) do
     if repo.in_transaction?() do
       raise ArgumentError,
             "pg_txn: PgTxn.transaction/3 cannot run inside another Repo transaction (each run commits or rolls back on its own)"
     end
 
     Schema.ensure!(repo)
+    # the Erlang process driving it: if it dies, its lease expires and any
+    # worker (this node's too) resumes a named transaction
+    owner = opts[:owner] || Ecto.UUID.generate()
+    lease_ms = opts[:lease_ms] || Config.get(repo, :lease_ms)
+
+    started_at =
+      case opts[:start] do
+        nil -> opts[:started_at] || DateTime.utc_now()
+        {name, input} -> start(repo, tx_id, name, input, owner, lease_ms, keys(opts))
+      end
 
     ctx = %{
       repo: repo,
       tx_id: tx_id,
-      # the Erlang process driving it: if it dies, its lease expires and any
-      # worker (this node's too) resumes a named transaction
-      owner: opts[:owner] || Ecto.UUID.generate(),
-      lease_ms: opts[:lease_ms] || Config.get(repo, :lease_ms),
-      owner_wait_ms: Config.get(repo, :owner_wait_ms),
+      owner: owner,
+      lease_ms: lease_ms,
       named: Keyword.get(opts, :named, false),
       repo_opts: Keyword.drop(opts, @own_opts),
       started_at: DateTime.truncate(started_at, :millisecond)
@@ -44,7 +56,7 @@ defmodule PgTxn.Loop do
     Local.driving(repo, tx_id)
 
     try do
-      loop(ctx, fun, false, 0)
+      loop(ctx, fun, 0)
     after
       Task.shutdown(heartbeat, :brutal_kill)
       Local.driven(repo, tx_id)
@@ -74,8 +86,56 @@ defmodule PgTxn.Loop do
     _ -> :ok
   end
 
-  defp loop(ctx, fun, claimed, retries) do
-    tx = Tx.new(ctx.repo, ctx.tx_id, ctx.owner, ctx.started_at, claimed)
+  @doc """
+  The keys of options `:key` (one) and `:keys` (a list) as stored, or nil
+  for none: a string as is, any other term as its JSON text (tuples as
+  arrays), like the other clients.
+  """
+  @spec keys(keyword) :: [String.t()] | nil
+  def keys(opts) do
+    one = if Keyword.has_key?(opts, :key), do: [opts[:key]], else: []
+
+    case Enum.map(one ++ (opts[:keys] || []), &key_text/1) do
+      [] -> nil
+      keys -> keys
+    end
+  end
+
+  defp key_text(key) when is_binary(key), do: key
+  defp key_text(key), do: key |> json_key() |> Jason.encode!()
+
+  defp json_key(t) when is_tuple(t), do: t |> Tuple.to_list() |> json_key()
+  defp json_key(l) when is_list(l), do: Enum.map(l, &json_key/1)
+  defp json_key(%{__struct__: _} = s), do: s
+  defp json_key(m) when is_map(m), do: Map.new(m, fn {k, v} -> {k, json_key(v)} end)
+  defp json_key(v), do: v
+
+  # records the transaction as running (named, or holding keys); with a key
+  # held by another transaction, waits for that one to end first
+  defp start(repo, tx_id, name, input, owner, lease_ms, keys) do
+    wait_ms = Config.get(repo, :key_wait_ms)
+    since = System.monotonic_time(:millisecond)
+
+    Stream.repeatedly(fn ->
+      SQL.one(repo, "SELECT created_at, holder::text AS holder FROM txn.start($1::text::uuid, $2, $3::text::jsonb, $4::text::uuid, $5, $6::text[])",
+        [tx_id, name, input, owner, lease_ms, keys])
+    end)
+    |> Enum.find_value(fn
+      %{"holder" => nil, "created_at" => created_at} ->
+        created_at
+
+      %{"holder" => holder} ->
+        wait_for(repo, holder, fn ->
+          waited = System.monotonic_time(:millisecond) - since
+          if waited > wait_ms, do: raise(KeyTimeoutError, key: Enum.join(keys, ", "), holder: holder, waited_ms: waited)
+        end)
+
+        nil
+    end)
+  end
+
+  defp loop(ctx, fun, retries) do
+    tx = Tx.new(ctx.repo, ctx.tx_id, ctx.owner, ctx.started_at)
 
     outcome =
       try do
@@ -89,10 +149,10 @@ defmodule PgTxn.Loop do
 
     if state.needs != [] do
       # a run that registered a need rolls back whatever user code did with the abort
-      claimed = perform(ctx, state) or claimed
-      loop(ctx, fun, claimed, retries)
+      perform(ctx, state)
+      loop(ctx, fun, retries)
     else
-      finish(ctx, fun, claimed, retries, outcome, state)
+      finish(ctx, fun, retries, outcome, state)
     end
   end
 
@@ -118,28 +178,24 @@ defmodule PgTxn.Loop do
     ArgumentError -> "null"
   end
 
-  defp finish(ctx, _fun, _claimed, _retries, {:ok, result}, state) do
+  defp finish(ctx, _fun, _retries, {:ok, result}, state) do
     if state.spawned, do: PgTxn.Worker.wake(ctx.repo)
     {:ok, result}
   end
 
-  defp finish(ctx, _fun, _claimed, _retries, {:error, reason}, _state) do
+  defp finish(ctx, _fun, _retries, {:error, reason}, _state) do
     fail(ctx, %{"name" => "Rollback", "message" => inspect(reason)})
     {:error, reason}
   end
 
-  defp finish(ctx, fun, claimed, retries, {:caught, kind, reason, stack}, _state) do
+  defp finish(ctx, fun, retries, {:caught, kind, reason, stack}, _state) do
     case kind == :error && SQL.pg_error(reason) do
       {"55P03", "fenced"} ->
         raise FencedError, tx_id: ctx.tx_id
 
-      {"55P03", "owner=" <> owner} ->
-        wait_for(ctx, owner)
-        loop(ctx, fun, claimed, retries)
-
       {code, _} when code in ["40001", "40P01"] and retries < 100 ->
         Process.sleep(:rand.uniform(min(1000, 5 * 2 ** min(retries + 1, 8))))
-        loop(ctx, fun, claimed, retries + 1)
+        loop(ctx, fun, retries + 1)
 
       _ ->
         fail(ctx, Call.error_json(if kind == :error, do: reason, else: %{"name" => to_string(kind), "message" => inspect(reason)}))
@@ -156,40 +212,16 @@ defmodule PgTxn.Loop do
 
   # ------------------------------------------------------------------ perform
 
-  # Claims the rows (once, all or nothing), then calls the needed effects
-  # outside of any transaction. Returns whether the claims are now in place.
+  # takes the lease and records the intents, then calls the needed effects
+  # outside of any transaction
   defp perform(ctx, state) do
-    case claim(ctx, state) do
-      %{"conflict" => %{"reason" => "fenced"}} ->
-        raise FencedError, tx_id: ctx.tx_id
-
-      %{"conflict" => %{"reason" => "owned", "owner" => owner}} ->
-        wait_for(ctx, owner)
-        false
-
-      %{"conflict" => _changed_or_gone} ->
-        false
-
-      %{"effects" => actions} ->
-        execute_all(ctx, state.needs, actions)
-        true
+    case prepare(ctx, state.needs) do
+      %{"effects" => actions} -> execute_all(ctx, state.needs, actions)
+      %{"conflict" => _fenced} -> raise FencedError, tx_id: ctx.tx_id
     end
   end
 
-  # txn.prepare_effects raises 55P03 'owner=<uuid>' when it loses a claim
-  # race to a transaction claiming the same row at the same time: an owned
-  # conflict like any other
-  defp claim(ctx, state) do
-    prepare(ctx, state.needs, state.claims)
-  rescue
-    e in Postgrex.Error ->
-      case SQL.pg_error(e) do
-        {"55P03", "owner=" <> owner} -> %{"conflict" => %{"reason" => "owned", "owner" => owner}}
-        _ -> reraise e, __STACKTRACE__
-      end
-  end
-
-  defp prepare(ctx, needs, claims) do
+  defp prepare(ctx, needs) do
     effects =
       Enum.map(needs, fn n ->
         %{
@@ -202,8 +234,8 @@ defmodule PgTxn.Loop do
         }
       end)
 
-    SQL.value(ctx.repo, "SELECT txn.prepare_effects($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb, $5::text::jsonb)",
-      [ctx.tx_id, ctx.owner, ctx.lease_ms, Jason.encode!(effects), Jason.encode!(claims)])
+    SQL.value(ctx.repo, "SELECT txn.prepare_effects($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb)",
+      [ctx.tx_id, ctx.owner, ctx.lease_ms, Jason.encode!(effects)])
   end
 
   defp execute_all(ctx, needs, [action]), do: execute(ctx, need(needs, action), action)
@@ -263,7 +295,7 @@ defmodule PgTxn.Loop do
   end
 
   defp again(ctx, need) do
-    case prepare(ctx, [need], []) do
+    case prepare(ctx, [need]) do
       %{"effects" => [action]} -> step(ctx, need, action)
       _conflict -> raise FencedError, tx_id: ctx.tx_id
     end
@@ -271,19 +303,15 @@ defmodule PgTxn.Loop do
 
   # ------------------------------------------------------------------ helpers
 
-  @doc "Waits until transaction `owner` is no longer running."
-  def wait_for(ctx, owner) do
-    start = System.monotonic_time(:millisecond)
-    wait_for(ctx, owner, start, 5)
-  end
+  # waits until transaction `tx_id` is no longer running; `check` may raise
+  defp wait_for(repo, tx_id, check), do: wait_for(repo, tx_id, check, 5)
 
-  defp wait_for(ctx, owner, start, ms) do
-    case SQL.one(ctx.repo, "SELECT status FROM txn.status($1::text::uuid)", [owner]) do
+  defp wait_for(repo, tx_id, check, ms) do
+    case SQL.one(repo, "SELECT status FROM txn.status($1::text::uuid)", [tx_id]) do
       %{"status" => "running"} ->
-        waited = System.monotonic_time(:millisecond) - start
-        if waited > ctx.owner_wait_ms, do: raise(OwnershipTimeoutError, owner: owner, waited_ms: waited)
+        check.()
         Process.sleep(ms)
-        wait_for(ctx, owner, start, min(round(ms * 1.5), 200))
+        wait_for(repo, tx_id, check, min(round(ms * 1.5), 200))
 
       _ ->
         :ok

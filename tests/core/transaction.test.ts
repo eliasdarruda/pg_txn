@@ -81,7 +81,7 @@ describe("transactions", () => {
       run++;
       // input changes between runs (as if the data it came from changed)
       const amount = run === 1 ? 10 : 20;
-      await tx.effect(async () => { seen.push(amount); return amount; }, { name: "charge", key: { amount }, compensate: async (charged) => { compensated.push({ charged }); } });
+      await tx.effect(async () => { seen.push(amount); return amount; }, { name: "charge", deps: { amount }, compensate: async (charged) => { compensated.push({ charged }); } });
     });
     assert.deepEqual(seen, [10, 20]);
     await waitFor(async () => compensated.find((c: any) => c.charged === 10), "refund of the unused charge");
@@ -108,7 +108,7 @@ describe("transactions", () => {
     const orderId = await newOrder(pool);
     await assert.rejects(pgtxn.transaction(async (tx) => {
       await tx.db.query("UPDATE orders SET status = 'charging' WHERE id = $1", [orderId]);
-      const p = await tx.effect(async () => ({ id: "pay_1" }), { name: "charge", key: { orderId }, compensate: async (p) => { compensated.push({ orderId, p }); } });
+      const p = await tx.effect(async () => ({ id: "pay_1" }), { name: "charge", deps: { orderId }, compensate: async (p) => { compensated.push({ orderId, p }); } });
       await tx.effect(async () => { throw new PermanentError("warehouse closed"); }, { name: "ship" });
       return p;
     }, { id: txId }), (e: unknown) => e instanceof EffectFailedError);

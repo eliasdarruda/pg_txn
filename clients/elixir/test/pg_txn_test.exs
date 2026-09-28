@@ -78,64 +78,54 @@ defmodule PgTxnTest do
     assert PgTxn.Tx.stable_uuid("tx:0") =~ ~r/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
   end
 
-  test "own + effect: the row is protected and nothing is held during the effect" do
+  test "during an effect nothing is held: other writers go through, no idle transaction" do
     id = insert_order()
     test = self()
 
-    task =
-      Task.async(fn ->
-        PgTxn.transaction(Repo, fn tx ->
-          row = PgTxn.own(tx, "orders", id)
+    {:ok, "ok"} =
+      PgTxn.transaction(Repo, fn tx ->
+        Repo.get!(PgTxn.Test.Order, id)
 
-          PgTxn.effect(tx, fn ->
-            send(test, {:in_effect, self()})
-            receive do: (:go -> {:ok, "done"})
-          end, name: "hold")
+        PgTxn.effect(tx, fn ->
+          Repo.query!("UPDATE orders SET status = 'touched' WHERE id = $1", [id])
 
-          Repo.query!("UPDATE orders SET status = 'held' WHERE id = $1", [id])
-          row["status"]
+          idle =
+            scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state LIKE 'idle in transaction%'")
+
+          send(test, {:idle, idle})
+          :ok
         end)
       end)
 
-    assert_receive {:in_effect, effect_pid}, 5_000
-
-    error = assert_raise Postgrex.Error, fn -> Repo.query!("UPDATE orders SET status = 'x' WHERE id = $1", [id]) end
-    assert error.postgres.code == :lock_not_available
-    assert error.postgres.detail =~ ~r/^owner=/
-
-    idle =
-      scalar("""
-      SELECT count(*) FROM pg_stat_activity
-       WHERE datname = current_database() AND state LIKE 'idle in transaction%'
-      """)
-
-    assert idle == 0
-
-    send(effect_pid, :go)
-    assert {:ok, "new"} = Task.await(task, 10_000)
-    assert order(id).status == "held"
-    # released at commit
-    Repo.query!("UPDATE orders SET status = 'free' WHERE id = $1", [id])
-    assert scalar("SELECT count(*) FROM txn.owned_rows") == 0
+    assert_received {:idle, 0}
+    assert order(id).status == "touched"
   end
 
-  test "own/3 takes an Ecto schema and returns nil for a missing row" do
-    id = insert_order(amount: 7)
+  test "the order was cancelled during the charge: the re-run returns early and the charge is compensated" do
+    test = self()
+    id = insert_order()
 
-    assert {:ok, {%{"amount" => 7, "id" => ^id}, nil}} =
-             PgTxn.transaction(Repo, fn tx -> {PgTxn.own(tx, PgTxn.Test.Order, id), PgTxn.own(tx, "orders", -1)} end)
+    assert {:ok, "skipped"} =
+             PgTxn.transaction(Repo, fn tx ->
+               if order(id).status != "new" do
+                 "skipped"
+               else
+                 p =
+                   PgTxn.effect(tx, fn ->
+                     Repo.query!("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id])
+                     %{"id" => "pay_1"}
+                   end, name: "charge", compensate: fn p -> send(test, {:refund, p["id"]}); :ok end)
+
+                 Repo.query!("UPDATE orders SET status = 'paid' WHERE id = $1", [id])
+                 p["id"]
+               end
+             end, key: {"order", id})
+
+    assert order(id).status == "cancelled"
+    assert_receive {:refund, "pay_1"}, 5_000
   end
 
-  test "own/3 after an effect is an error" do
-    assert_raise ArgumentError, ~r/before its first effect/, fn ->
-      PgTxn.transaction(Repo, fn tx ->
-        PgTxn.effect(tx, fn -> 1 end)
-        PgTxn.own(tx, "orders", 1)
-      end)
-    end
-  end
-
-  test "divergence: a re-run with a different key orphans the old effect and compensates it" do
+  test "deps: a re-run with different deps orphans the old effect and compensates it" do
     test = self()
     c = counter()
     id = insert_order(amount: 10)
@@ -146,10 +136,10 @@ defmodule PgTxnTest do
         %{rows: [[amount]]} = Repo.query!("SELECT amount FROM orders WHERE id = $1", [id])
 
         PgTxn.effect(tx, fn ->
-          # the row changes between runs (not owned, so allowed)
+          # the row changes between runs (nothing is locked)
           if bump(c, :charge) == 1, do: Repo.query!("UPDATE orders SET amount = 20 WHERE id = $1", [id])
           {:ok, %{"charged" => amount}}
-        end, name: "charge", key: %{amount: amount}, compensate: fn result, ctx -> send(test, {:refund, result, ctx}); :ok end)
+        end, name: "charge", deps: %{amount: amount}, compensate: fn result, ctx -> send(test, {:refund, result, ctx}); :ok end)
       end, id: tx_id)
 
     assert charged == %{"charged" => 20}
@@ -157,7 +147,7 @@ defmodule PgTxnTest do
 
     assert_receive {:refund, %{"charged" => 10}, %{tx_id: ^tx_id, attempt: 1}}, 5_000
     refute_receive {:refund, _, _}, 300
-    assert scalar("SELECT count(*) FROM txn.effects WHERE kind = 'call' AND name = 'charge' AND status = 'orphaned'") == 1
+    assert scalar("SELECT count(*) FROM txn.effects WHERE tx_id = $1::text::uuid AND kind = 'call' AND status = 'orphaned'", [tx_id]) == 1
 
     %{rows: [[name, input, status]]} =
       Repo.query!("SELECT name, input, status FROM txn.effects WHERE tx_id = $1::text::uuid AND kind = 'compensation'", [tx_id])
@@ -177,7 +167,7 @@ defmodule PgTxnTest do
         a = PgTxn.effect(tx, fn -> bump(c, :reserve); %{"hold" => 1} end, name: "reserve", compensate: fn r -> send(test, {:release, r}); :ok end)
         # a second effect: the first one's result is memoized in the re-run
         PgTxn.effect(tx, fn -> a["hold"] + 1 end, name: "plain")
-        PgTxn.effect(tx, fn -> "ok" end, name: "unused", compensate: fn _ -> send(test, :unused) end, key: 1)
+        PgTxn.effect(tx, fn -> "ok" end, name: "unused", compensate: fn _ -> send(test, :unused) end, deps: 1)
         raise "out of stock"
       end, id: tx_id)
     end
@@ -505,7 +495,7 @@ defmodule PgTxnTest do
   end
 
   test "run/4 drives a named transaction in this process" do
-    PgTxn.define(Repo, "echo", fn tx, input -> [PgTxn.effect(tx, fn -> input end, key: input), PgTxn.now(tx)] end)
+    PgTxn.define(Repo, "echo", fn tx, input -> [PgTxn.effect(tx, fn -> input end, deps: input), PgTxn.now(tx)] end)
     tx_id = Ecto.UUID.generate()
     assert {:ok, [%{"x" => 1}, now]} = PgTxn.run(Repo, "echo", %{x: 1}, id: tx_id)
     # now/1 is the stored start time, as in a resumed run
@@ -537,57 +527,160 @@ defmodule PgTxnTest do
     end)
   end
 
-  # ------------------------------------------------------------------ ownership
+  # ------------------------------------------------------------------ keys
 
-  # both transactions own row `id`, call a slow effect keyed on what they
-  # read, and increment it; returns their results and the effect log
-  defp contend(id, second_starts) do
-    test = self()
+  # records effects entering and leaving (to detect overlap)
+  defp tracked(c, label, ms) do
+    Agent.update(c, &Map.update(&1, :log, [{:in, label}], fn l -> [{:in, label} | l] end))
+    Process.sleep(ms)
+    Agent.update(c, &Map.update!(&1, :log, fn l -> [{:out, label} | l] end))
+    :ok
+  end
+
+  defp overlapped?(c) do
+    c
+    |> Agent.get(&Enum.reverse(Map.get(&1, :log, [])))
+    |> Enum.reduce_while(0, fn
+      {:in, _}, 0 -> {:cont, 1}
+      {:in, _}, _ -> {:halt, :overlap}
+      {:out, _}, n -> {:cont, n - 1}
+    end) == :overlap
+  end
+
+  test "keys are stored as text: strings as is, other terms as JSON like JSON.stringify" do
+    assert PgTxn.Loop.keys(key: "order:1") == ["order:1"]
+    assert PgTxn.Loop.keys(key: {"order", 42}) == [~s(["order",42])]
+    assert PgTxn.Loop.keys(key: ["order", 42], keys: [["account", 1], "x"]) == [~s(["order",42]), ~s(["account",1]), "x"]
+    assert PgTxn.Loop.keys([]) == nil
+    assert PgTxn.Loop.keys(keys: []) == nil
+
+    tx_id = Ecto.UUID.generate()
+    {:ok, 1} = PgTxn.transaction(Repo, fn _ -> 1 end, key: ["order", 42], id: tx_id)
+    assert scalar("SELECT keys FROM txn.transactions WHERE id = $1::text::uuid", [tx_id]) == [~s(["order",42])]
+  end
+
+  test "the same key: one at a time, each sees the other's committed writes" do
     c = counter()
+    id = insert_order()
 
-    work = fn label ->
-      PgTxn.transaction(Repo, fn tx ->
-        row = PgTxn.own(tx, "orders", id)
-
-        PgTxn.effect(tx, fn ->
-          Agent.update(c, &Map.update(&1, :log, [{:start, label}], fn l -> [{:start, label} | l] end))
-          send(test, {:started, label})
-          Process.sleep(300)
-          Agent.update(c, &Map.update!(&1, :log, fn l -> [{:stop, label} | l] end))
-          {:ok, row["n"]}
-        end, name: "slow_#{id}", key: row["n"])
-
-        Repo.query!("UPDATE orders SET n = n + 1 WHERE id = $1", [id])
-        row["n"]
+    bump = fn label ->
+      Task.async(fn ->
+        PgTxn.transaction(Repo, fn tx ->
+          PgTxn.effect(tx, fn -> tracked(c, label, 100) end)
+          Repo.query!("UPDATE orders SET amount = amount + 1 WHERE id = $1", [id])
+        end, key: ["order", id])
       end)
     end
 
-    a = Task.async(fn -> work.(:a) end)
-    if second_starts == :once_the_first_owns_the_row, do: assert_receive({:started, :a}, 5_000)
-    b = Task.async(fn -> work.(:b) end)
-    results = Task.await_many([a, b], 30_000)
-    {results, c |> Agent.get(& &1.log) |> Enum.reverse()}
+    [bump.(:a), bump.(:b), bump.(:c)] |> Task.await_many(15_000)
+    refute overlapped?(c)
+    assert order(id).amount == 3
   end
 
-  test "two transactions owning the same row serialize: the second waits" do
+  test "two checkouts of the same order with a key: one charge" do
+    c = counter()
     id = insert_order()
-    {results, log} = contend(id, :once_the_first_owns_the_row)
 
-    assert results == [{:ok, 0}, {:ok, 1}]
-    assert order(id).n == 2
-    # b's effect ran once, after a's, on the row as a left it
-    assert log == [start: :a, stop: :a, start: :b, stop: :b]
-    assert scalar("SELECT count(*) FROM txn.effects WHERE status = 'orphaned' AND name = $1", ["slow_#{id}"]) == 0
+    checkout = fn ->
+      Task.async(fn ->
+        PgTxn.transaction(Repo, fn tx ->
+          if order(id).status != "new" do
+            "already paid"
+          else
+            PgTxn.effect(tx, fn -> bump(c, :charge); Process.sleep(100); :ok end, name: "charge")
+            Repo.query!("UPDATE orders SET status = 'paid' WHERE id = $1", [id])
+            "paid"
+          end
+        end, key: "order:#{id}")
+      end)
+    end
+
+    outs = [checkout.(), checkout.()] |> Task.await_many(15_000) |> Enum.map(fn {:ok, o} -> o end)
+    assert Enum.sort(outs) == ["already paid", "paid"]
+    assert count(c, :charge) == 1
   end
 
-  # both prepare at the same moment: one claims the row, the other waits
-  test "two transactions owning the same row serialize: started together" do
-    id = insert_order()
-    {results, log} = contend(id, :at_once)
+  test "different keys run concurrently" do
+    t0 = System.monotonic_time(:millisecond)
 
-    assert Enum.sort(results) == [{:ok, 0}, {:ok, 1}]
-    assert order(id).n == 2
-    assert [{:start, x}, {:stop, x}, {:start, y}, {:stop, y}] = log
-    assert x != y
+    for k <- 1..4 do
+      Task.async(fn -> PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> Process.sleep(300); :ok end) end, key: ["k", insert_order(), k]) end)
+    end
+    |> Task.await_many(15_000)
+
+    assert System.monotonic_time(:millisecond) - t0 < 900
+  end
+
+  test "a key is released when the transaction fails, or has no effects" do
+    key = ["release", insert_order()]
+
+    assert_raise RuntimeError, "business rule", fn ->
+      PgTxn.transaction(Repo, fn tx ->
+        PgTxn.effect(tx, fn -> 1 end)
+        raise "business rule"
+      end, key: key)
+    end
+
+    assert {:ok, "no effects"} = PgTxn.transaction(Repo, fn _ -> "no effects" end, key: key)
+    t0 = System.monotonic_time(:millisecond)
+    assert {:ok, "again"} = PgTxn.transaction(Repo, fn _ -> "again" end, key: key)
+    assert System.monotonic_time(:millisecond) - t0 < 500
+    assert scalar("SELECT count(*) FROM txn.keys WHERE key = $1", [Jason.encode!(key)]) == 0
+  end
+
+  test "waiting longer than :key_wait_ms raises KeyTimeoutError" do
+    start_supervised!(PgTxn.ImpatientRepo)
+    test = self()
+    key = "slow:#{insert_order()}"
+
+    slow =
+      Task.async(fn ->
+        PgTxn.transaction(Repo, fn tx ->
+          PgTxn.effect(tx, fn -> send(test, :holding); Process.sleep(800); :ok end)
+        end, key: key)
+      end)
+
+    assert_receive :holding, 5_000
+    error = assert_raise PgTxn.KeyTimeoutError, fn -> PgTxn.transaction(PgTxn.ImpatientRepo, fn _ -> 1 end, key: key) end
+    assert error.key == key
+    assert {:ok, "ok"} = Task.await(slow, 5_000)
+  end
+
+  test "enqueued transactions with the same key run one at a time" do
+    c = counter()
+    id = insert_order()
+
+    PgTxn.define(Repo, "keyed_bump", fn tx, %{"n" => n} ->
+      PgTxn.effect(tx, fn -> tracked(c, n, 50) end)
+      Repo.query!("UPDATE orders SET amount = amount + 1 WHERE id = $1", [id])
+      n
+    end)
+
+    ids = for n <- 1..5, do: PgTxn.enqueue(Repo, "keyed_bump", %{n: n}, key: ["order", id])
+    for t <- ids, do: assert({:ok, _} = PgTxn.wait(Repo, t, 15_000))
+    refute overlapped?(c)
+    assert order(id).amount == 5
+  end
+
+  test "crossing transfers with keys on both accounts: one at a time, money conserved" do
+    c = counter()
+    a = insert_order(amount: 100)
+    b = insert_order(amount: 100)
+
+    transfer = fn from, to ->
+      Task.async(fn ->
+        PgTxn.transaction(Repo, fn tx ->
+          PgTxn.effect(tx, fn -> tracked(c, {from, to}, 30) end, name: "ledger")
+          Repo.query!("UPDATE orders SET amount = amount - 10 WHERE id = $1", [from])
+          Repo.query!("UPDATE orders SET amount = amount + 10 WHERE id = $1", [to])
+        end, keys: [["account", from], ["account", to]])
+      end)
+    end
+
+    tasks = for i <- 1..10, do: if(rem(i, 2) == 0, do: transfer.(a, b), else: transfer.(b, a))
+    assert Enum.all?(Task.await_many(tasks, 30_000), &match?({:ok, _}, &1))
+    refute overlapped?(c)
+    assert order(a).amount + order(b).amount == 200
+    assert {order(a).amount, order(b).amount} == {100, 100}
   end
 end

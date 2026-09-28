@@ -7,7 +7,7 @@ defmodule PgTxn.Config do
 
     * `:install` - install the `txn` schema when missing (default `true`)
     * `:lease_ms` - lease of a transaction or effect this node drives (default 30000)
-    * `:owner_wait_ms` - longest wait for a row owned by another transaction (default 300000)
+    * `:key_wait_ms` - longest wait for another transaction holding the same key (default 300000)
     * `:concurrency` - spawned effects and background transactions run at once (default 16)
     * `:poll_ms` - idle poll interval of the worker (default 250)
     * `:drain_ms` - how long the worker waits for work in progress on shutdown (default 30000)
@@ -17,7 +17,7 @@ defmodule PgTxn.Config do
   @defaults [
     install: true,
     lease_ms: 30_000,
-    owner_wait_ms: 300_000,
+    key_wait_ms: 300_000,
     concurrency: 16,
     poll_ms: 250,
     drain_ms: 30_000,

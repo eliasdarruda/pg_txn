@@ -26,20 +26,30 @@ stops.
 ```elixir
 def checkout(order_id) do
   PgTxn.transaction(Repo, fn tx ->
-    order = PgTxn.own(tx, Order, order_id)                 # nobody else can change it until this commits
+    order = Repo.get!(Order, order_id)
 
-    payment =
-      PgTxn.effect(tx, fn ctx -> Payments.charge(order["total"], idempotency_key: ctx.idempotency_key) end,
-        retry: true,                                       # safe: the provider deduplicates by the key
-        compensate: fn p, ctx -> Payments.refund(p["id"], idempotency_key: ctx.idempotency_key) end
-      )
+    if order.status != "new" do
+      {:already, order.status}                             # e.g. paid by a concurrent checkout
+    else
+      payment =
+        PgTxn.effect(tx, fn ctx -> Payments.charge(order.total, idempotency_key: ctx.idempotency_key) end,
+          retry: true,                                     # safe: the provider deduplicates by the key
+          compensate: fn p, ctx -> Payments.refund(p["id"], idempotency_key: ctx.idempotency_key) end
+        )
 
-    Repo.update_all(from(o in Order, where: o.id == ^order_id), set: [status: "paid", payment_id: payment["id"]])
-    PgTxn.spawn(tx, fn -> Mailer.send_receipt(order_id) end)   # runs iff this commits
-    payment["id"]
-  end)
+      Repo.update_all(from(o in Order, where: o.id == ^order_id), set: [status: "paid", payment_id: payment["id"]])
+      PgTxn.spawn(tx, fn -> Mailer.send_receipt(order_id) end)   # runs iff this commits
+      {:paid, payment["id"]}
+    end
+  end, key: {"order", order_id})                           # checkouts of one order run one at a time
 end
 ```
+
+Nothing is locked while the charge runs. If the order changes meanwhile
+(say it is cancelled), the next run sees it and returns early; the unused
+charge is then refunded by its `compensate`. The `:key` makes two checkouts
+of the same order run one after the other, so the second sees the first's
+`paid` status and charges nothing.
 
 Inside the function, use the Repo as usual; each run is a real
 `Repo.transaction`. It returns `{:ok, value}`. `Repo.rollback(reason)`
@@ -48,15 +58,18 @@ committed and completed effects are compensated.
 
 ## API
 
-### `PgTxn.own(tx, table, key)`
+### `PgTxn.transaction(repo, fun, opts)`
 
-Reads a row and protects it until the transaction ends. Other writers get a
-`Postgrex.Error` (`:lock_not_available`) at once, and another pg_txn
-transaction waits.
+| option | default | |
+|---|---|---|
+| `:key` | none | transactions with the same key run one at a time; the others wait, holding nothing |
+| `:keys` | none | several keys, claimed all at once or none (no deadlocks), e.g. `keys: [{"account", from}, {"account", to}]` |
+| `:id` | a new uuid | the transaction id |
 
-- `table` is a table name or an Ecto schema module.
-- It returns the row as a map with string keys, or `nil`.
-- Call it before the first effect.
+A key is a string, used as is, or any JSON-able term: `{"order", 42}` and
+`["order", 42]` are both stored as `["order",42]`, the same key as in the
+other clients. A transaction that waits longer than `:key_wait_ms` raises
+`PgTxn.KeyTimeoutError`. Other options go to `Repo.transaction/2`.
 
 ### `PgTxn.effect(tx, fun, opts)`
 
@@ -69,7 +82,7 @@ outside of any database transaction, and returns its recorded result.
 | `:retry` | off | `true` (5 attempts) or `[attempts: n]`. Without it, `fun` is called at most once, and an error, timeout or crash mid-call fails the effect. |
 | `:compensate` | | `fn result -> … end` or `fn result, ctx -> … end`: undoes the effect if the transaction does not use its result. Uses the same `:retry`. |
 | `:timeout_ms` | 30000 | per attempt |
-| `:key` | `nil` | describes the call; a re-run with a different key makes a new effect |
+| `:deps` | `nil` | the data the call is decided on; a re-run with different deps makes a new effect (the old one is compensated) |
 | `:name` | `"effect"` | a label in `txn.effects` |
 
 With `:retry` on:
@@ -112,6 +125,9 @@ id = PgTxn.enqueue(Repo, "settle", %{invoice_id: 7})         # on any node that 
 PgTxn.wait(Repo, id)
 ```
 
+`run/4`, `enqueue/4` and `PgTxn.Multi.enqueue` take `:key` and `:keys` too.
+An enqueued transaction starts once no other transaction holds its keys.
+
 ### `PgTxn.now(tx)` and `PgTxn.uuid(tx)`
 
 A timestamp and UUIDs that are the same in every run.
@@ -129,7 +145,7 @@ config :my_app, MyApp.Repo, pg_txn: [concurrency: 32]
 |---|---|---|
 | `:concurrency` | 16 | spawned functions, compensations and background transactions run at once |
 | `:lease_ms` | 30000 | lease of a transaction or effect this node drives |
-| `:owner_wait_ms` | 300000 | how long to wait for a row owned by another transaction |
+| `:key_wait_ms` | 300000 | how long a transaction waits for another one holding its key |
 | `:listen` | `true` | wake the worker with LISTEN; `false` behind RDS Proxy or a transaction pooler |
 | `:poll_ms` | 250 | idle poll interval |
 | `:drain_ms` | 30000 | how long shutdown waits for work in progress |

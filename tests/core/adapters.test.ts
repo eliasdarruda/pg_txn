@@ -66,26 +66,23 @@ instances.push(...stacks.map((s) => s.pgtxn));
 
 describe("database libraries", () => {
   for (const s of stacks) {
-    test(`${s.name}: own, effect in the middle, write back atomically; plain SQL blocked meanwhile`, async () => {
+    test(`${s.name}: effect in the middle, write back atomically, one at a time per key`, async () => {
       const id = await newOrder(pool, { amount: 30 });
       let charges = 0;
-      let blocked = "";
-      const out = await s.pgtxn.transaction(async (tx) => {
-        await tx.own("orders", id);
+      const checkout = () => s.pgtxn.transaction(async (tx) => {
         const o = await s.read(tx, id);
         if (o.status !== "new") return "skipped";
         const p = await tx.effect(async () => {
           charges++;
-          blocked = await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [id]).then(() => "no", (e) => e.code);
           await sleep(50);
           return { id: `pay_${o.amount}` };
         }, { name: "charge" });
         await s.markPaid(tx, id, p.id);
         return p.id;
-      });
-      assert.equal(out, "pay_30");
+      }, { key: ["order", id] });
+      const outs = await Promise.all([checkout(), checkout()]);
+      assert.deepEqual(outs.sort(), ["pay_30", "skipped"]);
       assert.equal(charges, 1);
-      assert.equal(blocked, "55P03");
       assert.deepEqual((await pool.query("SELECT status, payment_id FROM orders WHERE id = $1", [id])).rows[0], { status: "paid", payment_id: "pay_30" });
     });
   }

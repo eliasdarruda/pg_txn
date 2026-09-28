@@ -66,9 +66,16 @@ test("replicas share the transactions; a killed replica loses nothing; stopped o
   assert.equal(JSON.parse(docker(["inspect", "-f", "{{json .State}}", replicas[1]])).ExitCode, 0, "drained and exited");
 
   // everything that was enqueued finishes on the surviving replicas, including
-  // the killed one's transactions (it may have died before enqueueing all of its own)
-  await waitFor(async () => (await one("SELECT count(*) FROM txn.transactions WHERE status <> 'committed'")) === 0
-    && (await one("SELECT count(*) FROM txn.transactions")) >= 4 * JOBS, "all transactions committed", 180_000);
+  // the killed one's transactions; the killed and the stopped replica may not
+  // have enqueued all of theirs, the three others did
+  let last = "";
+  await waitFor(async () => {
+    const r = (await pool.query(`SELECT status, owner IS NULL AS queued, (lease_until < now()) AS expired, count(*)::int AS n
+      FROM txn.transactions GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`)).rows;
+    last = `${JSON.stringify(r)}, keys held ${await one("SELECT count(*) FROM txn.keys")}`;
+    return (await one("SELECT count(*) FROM txn.transactions WHERE status <> 'committed'")) === 0
+      && (await one("SELECT count(*) FROM txn.transactions")) >= 3 * JOBS;
+  }, "all transactions committed", 180_000).catch((e) => { throw new Error(`${e.message}: ${last}`); });
   const total = await one("SELECT count(*) FROM txn.transactions WHERE status = 'committed'");
   assert.equal(await one("SELECT sum(n) FROM counters"), total, "every bump applied exactly once");
 

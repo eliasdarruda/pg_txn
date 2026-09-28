@@ -10,15 +10,17 @@ side and in lockstep.
                      for the whole call, a deposit blocks until lock_timeout,
                      and every waiting session holds a transaction open.
   pg_txn             a SQL schema plus a library in the app, on stock
-                     PostgreSQL. Run 1 owns account A and B together (all or
-                     nothing, a claim, not a lock) in a short DB transaction,
-                     reaches the fraud check and rolls back: the call runs
-                     from the app with no transaction, row lock or connection
-                     held. T2 finds the rows owned and waits outside any
-                     transaction, so nothing can deadlock; a plain UPDATE on
-                     A fails at once with 55P03. The result is recorded, run 2
-                     writes both balances and commits atomically in one DB
-                     transaction, then T2 runs.
+                     PostgreSQL. T1 takes the keys account:A and account:B
+                     together in txn.start (all or nothing: rows in txn.keys,
+                     not locks), then run 1 reads both accounts in a short DB
+                     transaction, reaches the fraud check and rolls back: the
+                     call runs from the app with no transaction, row lock or
+                     connection held. T2 (B->A) finds the keys held and waits
+                     outside any transaction, so nothing can deadlock; T3,
+                     another transfer from A, waits for key A too. The result
+                     is recorded, run 2 writes both balances and commits
+                     atomically in one DB transaction, releasing the keys
+                     (txn.finish); then T2 takes them and runs.
 
 Pure SVG + SMIL (no scripts), so it animates when embedded in a GitHub README
 (<img>), and follows the viewer's light/dark preference. Same visual language
@@ -46,7 +48,7 @@ ACQ = S[7] + 0.35             # plain PostgreSQL: T2 gets both locks
 REC = RET + TRAVEL            # pg_txn: the fraud check's result is recorded
 CMT = REC + TRAVEL            # pg_txn: run 2 commits both balances
 T2S = S[7] + 0.25             # pg_txn: T2 is woken up and runs
-OWN2 = T2S + TRAVEL / 2       # pg_txn: T2 owns both accounts
+KEY2 = T2S + TRAVEL / 2       # pg_txn: T2 takes both keys
 
 
 def arr(t):
@@ -188,10 +190,11 @@ def lock(x, y, cls, t0, t1):
             f'<rect x="-9" y="-3" width="18" height="14" rx="3" class="lockbody {cls}"/></g>')
 
 
-def crown(x, y, cls, t0, t1):
-    """ownership of an actor, in the colour of the owning transaction."""
+def key_glyph(x, y, cls, t0, t1):
+    """a transaction key (a row in txn.keys, not a lock), in the colour of the holder."""
     return (f'<g opacity="0" transform="translate({x},{y})">{visible(t0, t1)}'
-            f'<path d="M-10,7 L-10,-5 L-5,1 L0,-9 L5,1 L10,-5 L10,7 Z" class="crownc {cls}"/></g>')
+            f'<circle cx="-5" cy="0" r="4.5" class="keyc {cls}"/>'
+            f'<path d="M-0.5,0 H10 M6,0 v4 M9,0 v3" class="keyc {cls}"/></g>')
 
 
 def owner(x, y, s, cls, t0, t1):
@@ -427,45 +430,46 @@ def panel_pgtxn():
     other_r = (110, 322)
     fraud_l = (FRAUD[0] - 40, 173)
     p = []
-    header(p, "pg_txn", "t", "owns both rows, holds no locks or connections")
+    header(p, "pg_txn", "t", "keys A, B; holds no locks or connections")
     p += [link(app_b, pg_top), link(lib_r, fraud_l), link(other_r, pg_l)]
     p.append(hot(app_b, pg_top, "t", S[0]))
     p.append(hot(lib_r, fraud_l, "t", S[3]))
-    p.append(hot(other_r, pg_l, "w", S[4]))
+    p.append(hot(other_r, pg_l, "n", S[4]))
     p.append(icon_app_with_lib(*app))
     p.append(icon_api(*FRAUD, "Fraud check API"))
     p.append(icon_store(*PG, "stock PostgreSQL"))
-    p.append(icon_app(*OTHER, "another client"))
+    p.append(icon_app(*OTHER, "another replica"))
     accounts(p, CMT)
     timer(p, "t", CMT + 0.4)
 
-    # ownership: both rows claimed at once in run 1, kept across the rollback, released at the commit
-    own1 = S[0] + TRAVEL / 2
-    cx, tx = ROWX + 6, ROWX + 19
+    # keys: both taken at once in txn.start (all or nothing), kept across the rollback,
+    # released in the commit (txn.finish); rows in txn.keys, not locks
+    key1 = S[0] + TRAVEL / 2
+    cx, tx = ROWX + 5, ROWX + 19
     for y in (ROWA, ROWB):
-        p.append(crown(cx, y - 1, "t", own1, CMT))
-        p.append(owner(tx, y, "T1", "t", own1, CMT))
-        p.append(crown(cx, y - 1, "p", OWN2, END))
-        p.append(owner(tx, y, "T2", "p", OWN2, END))
+        p.append(key_glyph(cx, y - 1, "t", key1, CMT))
+        p.append(owner(tx, y, "T1", "t", key1, CMT))
+        p.append(key_glyph(cx, y - 1, "p", KEY2, END))
+        p.append(owner(tx, y, "T2", "p", KEY2, END))
 
     p.append(badge(331, 250, "T2 waits outside any transaction", "chip-p", S[2] + TRAVEL / 2, S[3], 240))
     p.append(card(200, 226, 262, ["open transactions: 0 · row locks: 0", "connections held: 0"],
                   "chip-good", S[3] + 0.4, RET))
-    p.append(badge(OTHER[0] + 6, OTHER[1] - 44, "55P03 at once", "chip-bad", S[4] + 0.45, S[6], 116))
+    p.append(badge(OTHER[0] + 6, OTHER[1] - 44, "waits for key A", "chip-neutral", S[4] + 0.45, S[6], 124))
 
     p.append(marker(app_b, pg_top, "1", "numt", S[0], 1, 0.5))
     p.append(marker(lib_r, fraud_l, "4", "numt", S[3], -1, 0.5))
-    p.append(marker(other_r, pg_l, "5", "numw", S[4], 1, 0.5))
+    p.append(marker(other_r, pg_l, "5", "numn", S[4], 1, 0.5))
 
-    p.append(dot(app_b, pg_top, S[0], "dt", bounce=True))                  # run 1: own A, own B
+    p.append(dot(app_b, pg_top, S[0], "dt", bounce=True))                  # txn.start: keys A, B; run 1 reads
     p.append(dot(app_b, pg_top, S[1], "dt"))                               # the effect: ROLLBACK
-    p.append(dot(app_b, pg_top, S[2], "dp", bounce=True))                  # T2: owned, so it waits
+    p.append(dot(app_b, pg_top, S[2], "dp", bounce=True))                  # T2: keys held, so it waits
     p.append(dot(lib_r, fraud_l, S[3], "dt", hold=S[6]))                   # the effect, from the app
     p.append(dot(fraud_l, lib_r, S[6], "dt"))                              # its result
     p.append(dot(app_b, pg_top, RET, "dt"))                                # the result is recorded
     p.append(dot(app_b, pg_top, REC, "dt"))                                # run 2: both writes, COMMIT
-    p.append(dot(other_r, pg_l, S[4], "dwarn", bounce=True, t1=S[4] + 0.6))  # UPDATE A: 55P03
-    p.append(dot(app_b, pg_top, T2S, "dp", bounce=True))                   # T2's run 1 owns A and B
+    p.append(dot(other_r, pg_l, S[4], "dn", bounce=True, t1=S[4] + 0.6))  # T3: key A held, so it waits
+    p.append(dot(app_b, pg_top, T2S, "dp", bounce=True))                   # T2 takes keys A, B; its run 1
     p.append(dot(lib_r, fraud_l, T2S + 1.0, "dp", hold=END))              # T2's own effect
 
     # a DB transaction is open only for the short runs; run 2's UPDATEs lock the rows until its COMMIT
@@ -474,29 +478,30 @@ def panel_pgtxn():
     p.append(text(24, 412, "transactions", "tiny", "start"))
     p.append(small_counter(PW - 24, 412, "open transactions / pinned connections",
                            [("0", 0, S[0]), ("1", S[0], arr(S[1])), ("0", arr(S[1]), S[2]),
-                            ("1", S[2], arr(S[2])), ("0", arr(S[2]), RET), ("1", RET, CMT),
+                            ("1", S[2], arr(S[2])), ("0", arr(S[2]), S[4]),
+                            ("1", S[4], S[4] + 0.6), ("0", S[4] + 0.6, RET), ("1", RET, CMT),
                             ("0", CMT, T2S), ("1", T2S, arr(T2S)), ("0", arr(T2S), END)], "t"))
     p.append(lane(LANEX, LANES[0], LANEW, ("1", "T1 transfer A→B"), "numt", [
-        ("run 1: owns A, B", "chip-t", own1, arr(S[1])),
-        ("rolled back · owns A, B", "chip-t", arr(S[1]), S[3]),
+        ("keys A, B · run 1", "chip-t", key1, arr(S[1])),
+        ("rolled back · keys A, B", "chip-t", arr(S[1]), S[3]),
         ("effect: nothing held", "chip-t", S[3], RET),
-        ("run 2: one commit", "chip-t", RET, CMT),
+        ("run 2: commit, keys released", "chip-t", RET, CMT),
         ("committed", "chip-good", CMT, END)]))
     p.append(lane(LANEX, LANES[1], LANEW, ("2", "T2 transfer B→A"), "nump", [
-        ("waits outside any transaction", "chip-neutral", S[2] + TRAVEL / 2, OWN2),
-        ("owns A, B", "chip-p", OWN2, END)]))
-    p.append(lane(LANEX, LANES[2], LANEW, ("D", "UPDATE A (deposit)"), "numn", [
-        ("fails fast: 55P03", "chip-bad", S[4] + 0.45, END)]))
+        ("waits outside any transaction", "chip-neutral", S[2] + TRAVEL / 2, KEY2),
+        ("keys A, B", "chip-p", KEY2, END)]))
+    p.append(lane(LANEX, LANES[2], LANEW, ("3", "T3 transfer A→C"), "numn", [
+        ("waits for key A", "chip-neutral", S[4] + 0.45, END)]))
 
     caps = [
-        (0, "1", "run 1: T1 owns A and B together, all or nothing:\ncrowns, not locks", "cap"),
-        (1, "2", "T1 reaches the fraud check: ROLLBACK.\nthe claims stay, nothing is held", "cap"),
-        (2, "3", "T2 (B→A) finds A and B owned: it waits outside\nany transaction, so no deadlock", "cap"),
+        (0, "1", "T1 takes keys account:A and account:B together,\nall or nothing: rows in txn.keys, not locks", "cap"),
+        (1, "2", "run 1 reaches the fraud check: ROLLBACK.\nthe keys stay, nothing is held", "cap"),
+        (2, "3", "T2 (B→A) finds the keys held: it waits outside\nany transaction, so no deadlock", "cap"),
         (3, "4", "the fraud check is called from the app:\n0 transactions, 0 row locks, 0 connections", "cap"),
-        (4, "5", "a plain UPDATE on account A fails at once: 55P03", "cap warn"),
-        (5, "6", "slow provider: A and B stay owned, still 0 locks", "cap"),
-        (6, "7", "result recorded; run 2 writes both balances\nand commits atomically in one DB transaction", "cap good"),
-        (7, "8", "A and B are released: T2 owns them and runs", "cap good"),
+        (4, "5", "T3 (A→C, another replica) needs key A:\nit waits too, still 0 locks, 0 connections", "cap"),
+        (5, "6", "slow provider: keys A, B stay held, still 0 locks", "cap"),
+        (6, "7", "result recorded; run 2 writes both balances,\ncommits and releases the keys in one DB transaction", "cap good"),
+        (7, "8", "keys A, B are free: T2 takes them and runs", "cap good"),
     ]
     for i, (s, n, c, cls) in enumerate(caps):
         t1 = S[caps[i + 1][0]] if i + 1 < len(caps) else END
@@ -504,16 +509,17 @@ def panel_pgtxn():
 
     p.append(f'<line x1="24" y1="570" x2="{PW - 24}" y2="570" class="rule"/>')
     code = ["await pgtxn.transaction(async (tx) =&gt; {",
-            "  const a = await tx.own(\"accounts\", \"A\")",
-            "  const b = await tx.own(\"accounts\", \"B\")",
+            "  const [a, b] = await tx.db.select().from(accounts)",
+            "    .where(inArray(accounts.id, [\"A\", \"B\"])).orderBy(accounts.id)",
             "  const verdict = await tx.effect(() =&gt; fraudCheck(a, b, 30))",
             "  if (verdict.blocked) throw new Error(\"transfer refused\")",
-            "  await tx.db.query(\"UPDATE accounts SET balance=balance-30 WHERE id='A'\")",
-            "  await tx.db.query(\"UPDATE accounts SET balance=balance+30 WHERE id='B'\")",
-            "})"]
-    p.append(code_block(CODEY, code, [(0, 2, S[0], S[1]), (3, 3, S[1], RET), (1, 7, RET, S[7])], "t"))
-    for i, ln in enumerate(["owned across the call · nothing held in Postgres",
-                            "SQL fails fast (55P03) · T2 waits, never deadlocks",
+            "  await tx.db.update(accounts).set({ balance: a.balance - 30 })…",
+            "  await tx.db.update(accounts).set({ balance: b.balance + 30 })…",
+            "}, { keys: [[\"account\", \"A\"], [\"account\", \"B\"]] })"]
+    p.append(code_block(CODEY, code, [(0, 2, S[0], S[1]), (7, 7, S[0], S[1]), (3, 3, S[1], RET),
+                                      (1, 7, RET, S[7])], "t"))
+    for i, ln in enumerate(["keys held across the call · no locks, no connections",
+                            "all keys at once · T2, T3 wait, never deadlock",
                             "both balances commit in one DB transaction"]):
         p.append(text(24, SUMY + i * 18, ln, "sum good", "start"))
     return panel(PW + 20, p, top)
@@ -545,12 +551,13 @@ text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans
 .libt { font-size: 12.5px; font-weight: 700; fill: var(--t); } .libc rect { fill: var(--t); }
 .link { stroke: var(--line); stroke-width: 2; stroke-dasharray: 5 6; }
 .hot { stroke-width: 2.5; } .hot.o { stroke: var(--o); } .hot.t { stroke: var(--t); } .hot.w { stroke: var(--bad); stroke-dasharray: 5 5; }
+.hot.n { stroke: var(--muted); stroke-dasharray: 5 5; }
 .row { fill: var(--soft); stroke: var(--line); }
 .chip-neutral { fill: var(--muted); } .chip-warn { fill: var(--warn); } .chip-bad { fill: var(--bad); } .chip-good { fill: var(--good); }
 .chip-o { fill: var(--o); } .chip-t { fill: var(--t); } .chip-p { fill: var(--p); }
 .lockbody.o { fill: var(--o); } .lockbody.p { fill: var(--p); } .lockarc { fill: none; stroke-width: 2.4; }
 .lockarc.o { stroke: var(--o); } .lockarc.p { stroke: var(--p); }
-.crownc.t { fill: var(--t); } .crownc.p { fill: var(--p); }
+.keyc { fill: none; stroke-width: 2.4; stroke-linecap: round; } .keyc.t { stroke: var(--t); } .keyc.p { stroke: var(--p); }
 .do { fill: var(--o); } .dt { fill: var(--t); } .dp { fill: var(--p); } .dn { fill: var(--muted); } .dwarn { fill: var(--bad); }
 .track { fill: var(--soft); stroke: var(--line); } .fill.o { fill: var(--o); } .fill.t { fill: var(--t); }
 .rule { stroke: var(--line); } .file { fill: var(--soft); stroke: var(--line); }
@@ -560,7 +567,7 @@ text { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans
 
 def main():
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img"
-  aria-label="Animation: a transfer of 30 from account A to account B that reads both accounts, calls a slow fraud check and then moves the money, in plain PostgreSQL and with pg_txn. Plain PostgreSQL: T1 locks A with SELECT FOR UPDATE while a second transfer T2 from B to A locks B; each waits for the other's row and T2 is aborted with deadlock detected. T1 then holds both row locks, idle in transaction, for the whole fraud check; a deposit to A blocks until lock_timeout and T2's retry blocks too, each holding a transaction and a connection open. T1 commits and T2 takes both locks for its own slow call. pg_txn, a SQL schema plus a library in the app on stock PostgreSQL: run 1 owns A and B together, all or nothing, without row locks, reaches the fraud check and rolls back; T2 finds both rows owned and waits outside any transaction, so there is no deadlock; the fraud check runs from the app with 0 open transactions, 0 row locks and 0 connections held; a plain UPDATE on account A fails at once with SQLSTATE 55P03; the result is recorded and run 2 writes both balances, A 100 to 70 and B 50 to 80, committing atomically in one DB transaction; then T2 owns both accounts and runs.">
+  aria-label="Animation: a transfer of 30 from account A to account B that reads both accounts, calls a slow fraud check and then moves the money, in plain PostgreSQL and with pg_txn. Plain PostgreSQL: T1 locks A with SELECT FOR UPDATE while a second transfer T2 from B to A locks B; each waits for the other's row and T2 is aborted with deadlock detected. T1 then holds both row locks, idle in transaction, for the whole fraud check; a deposit to A blocks until lock_timeout and T2's retry blocks too, each holding a transaction and a connection open. T1 commits and T2 takes both locks for its own slow call. pg_txn, a SQL schema plus a library in the app on stock PostgreSQL: T1 takes the keys account:A and account:B together, all or nothing, as rows in txn.keys rather than locks, then run 1 reads both accounts, reaches the fraud check and rolls back; T2 finds the keys held and waits outside any transaction, so there is no deadlock; the fraud check runs from the app with 0 open transactions, 0 row locks and 0 connections held; T3, another transfer from account A on another replica, waits for key A too; the result is recorded and run 2 writes both balances, A 100 to 70 and B 50 to 80, committing atomically in one DB transaction that releases the keys; then T2 takes both keys and runs.">
 <title>Two-account transfer: plain PostgreSQL vs pg_txn</title>
 <style>{STYLE}</style>
 <rect width="{W}" height="{H}" class="bg"/>

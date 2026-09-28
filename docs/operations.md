@@ -2,8 +2,8 @@
 
 ## Installing the schema
 
-pg_txn on the database side is one schema, `txn`, of tables, plpgsql
-functions and a trigger function ([`extension/sql/pg_txn--1.0.sql`](../extension/sql/pg_txn--1.0.sql)).
+pg_txn on the database side is one schema, `txn`, of tables and plpgsql
+functions. It adds nothing to your own tables: no triggers, no columns ([`extension/sql/pg_txn--1.0.sql`](../extension/sql/pg_txn--1.0.sql)).
 PostgreSQL 14 or later; no superuser, no `shared_preload_libraries`, no
 restart. Three ways to install it:
 
@@ -17,10 +17,7 @@ Clients check `txn.meta.version` against the version they were built for and
 refuse to run against a different one.
 
 **Roles.** Whoever installs the schema owns it and can use it. For another
-role: `SELECT txn.grant_to('app_role')`. Rows a transaction owns get a guard
-trigger on their table the first time (`CREATE OR REPLACE TRIGGER
-pg_txn_guard`), which needs ownership of that table; if the application
-role does not own it, run `SELECT txn.guard('orders')` once in a migration.
+role: `SELECT txn.grant_to('app_role')`.
 
 ## Client options
 
@@ -48,7 +45,7 @@ even then belongs in an enqueued defined transaction.
   process dies is resumed by another process that defines the same name,
   once its lease expires; recorded effects are reused and re-run calls keep
   their idempotency key. An inline `transaction(fn)` cannot be resumed
-  elsewhere: it is marked abandoned and its owned rows are released; the
+  elsewhere: it is marked abandoned and its keys are released; the
   compensation functions of its completed effects died with the process,
   so those are reported as `EffectLost`.
 - **Connections.** A run holds one connection while your function runs
@@ -67,15 +64,12 @@ even then belongs in an enqueued defined transaction.
 | object | content |
 |---|---|
 | `txn.doctor()` | schema version, active workers, effects due for over a minute, effects lost with their process, stalled transactions, orphaned effects without compensation |
-| `txn.running_transactions` | transactions in flight: name, driving process, runs, lease, age |
-| `txn.owned` | owned rows and their transactions |
+| `txn.running_transactions` | transactions in flight: name, keys, driving process, runs, lease, age |
+| `txn.keys` | keys held, and the transaction holding each |
 | `txn.pending_effects` | effects not finished: status, attempts, next attempt, last error |
 | `txn.effect_attempts` | one row per finished attempt: outcome (`succeeded`, `retry`, `failed`, `lease_expired`, `stale`, `ambiguous`), error, process, timings |
 | `txn.effect_errors` | failed attempts with `error_name`, `error_message`, duration |
 | `txn.status(id)` | a transaction's status, output, error, runs |
-
-`55P03` with `DETAIL: owner=<uuid>` means a write hit a row owned by that
-transaction; look it up in `txn.running_transactions`.
 
 ## Retention
 
