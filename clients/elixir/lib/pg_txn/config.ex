@@ -12,6 +12,15 @@ defmodule PgTxn.Config do
     * `:poll_ms` - idle poll interval of the worker (default 250)
     * `:drain_ms` - how long the worker waits for work in progress on shutdown (default 30000)
     * `:listen` - wake the worker with `LISTEN txn_effects` (default `true`)
+
+  Rarely changed (the worker's maintenance):
+
+    * `:maintain_ms` - how often it abandons stopped transactions, expires
+      effect leases and forgets unneeded functions (default 5000)
+    * `:forget_after_ms` - a spawned or compensation function is checked for
+      being forgotten once it is this old (default 30000): it is when its
+      effect is finished, or still invisible (never committed) after
+      `:forget_invisible_ms` (default 3600000)
   """
 
   @defaults [
@@ -21,7 +30,10 @@ defmodule PgTxn.Config do
     concurrency: 16,
     poll_ms: 250,
     drain_ms: 30_000,
-    listen: true
+    listen: true,
+    maintain_ms: 5_000,
+    forget_after_ms: 30_000,
+    forget_invisible_ms: 3_600_000
   ]
 
   @doc "The options of `repo` (read once, then cached)."

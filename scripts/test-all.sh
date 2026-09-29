@@ -5,7 +5,7 @@
 # summary table.
 #
 #   scripts/test-all.sh
-#   ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir pack
+#   ONLY="unit core" scripts/test-all.sh      # groups: unit core adversarial compat bun elixir pack
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -49,6 +49,7 @@ want unit && step ts-unit node_test 'clients/typescript/*/test/*.test.ts'
 step fresh-servers fresh_servers
 
 want core && step core-pg18 node_test 'tests/core/*.test.ts'
+want adversarial && step adversarial-pg18 node_test 'tests/adversarial/*.test.ts'
 if want compat; then
   step core-pg14 env PG_TXN_URL=postgres://app:app@localhost:55433/app bash -c "$(declare -f node_test); node_test 'tests/core/*.test.ts'"
   step core-pgbouncer env PG_TXN_URL=postgres://app:app@localhost:55434/app bash -c "$(declare -f node_test); node_test 'tests/core/*.test.ts'"

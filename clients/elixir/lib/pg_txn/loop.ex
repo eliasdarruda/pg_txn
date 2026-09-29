@@ -7,7 +7,15 @@ defmodule PgTxn.Loop do
   require Logger
   alias PgTxn.{Call, Config, DJSON, FencedError, KeyTimeoutError, Local, NeedEffect, Schema, SQL, Tx}
 
-  @own_opts [:id, :lease_ms, :named, :owner, :key, :keys, :start, :started_at]
+  @own_opts [:id, :lease_ms, :named, :owner, :key, :keys, :start, :started_at, :isolation]
+  @isolations %{
+    "read committed" => "read committed",
+    "repeatable read" => "repeatable read",
+    "serializable" => "serializable",
+    read_committed: "read committed",
+    repeatable_read: "repeatable read",
+    serializable: "serializable"
+  }
 
   @doc """
   Drives transaction `tx_id` to its end. Returns `{:ok, value}` when it
@@ -15,9 +23,11 @@ defmodule PgTxn.Loop do
   and re-raises whatever the function raised (after recording the failure).
 
   Options (besides `Repo.transaction/2` ones): `:owner`, `:lease_ms`,
-  `:named`, `:started_at` (of a resumed transaction), or `start: {name,
-  encoded_input}` with `:key`/`:keys` to record it as running first
-  (`txn.start`, waiting for the keys).
+  `:named`, `:isolation`, `:started_at` (of a resumed transaction), or
+  `start: {name, encoded_input}` with `:key`/`:keys` to record it as running
+  first (`txn.start`, waiting for the keys). If `txn.start` finds the id
+  exists already (it ran, or runs now elsewhere), nothing is run: this waits
+  for its outcome, like `PgTxn.wait/3`.
   """
   def drive(repo, tx_id, fun, opts) do
     if repo.in_transaction?() do
@@ -30,13 +40,29 @@ defmodule PgTxn.Loop do
     # worker (this node's too) resumes a named transaction
     owner = opts[:owner] || Ecto.UUID.generate()
     lease_ms = opts[:lease_ms] || Config.get(repo, :lease_ms)
+    isolation = isolation!(opts[:isolation])
 
-    started_at =
-      case opts[:start] do
-        nil -> opts[:started_at] || DateTime.utc_now()
-        {name, input} -> start(repo, tx_id, name, input, owner, lease_ms, keys(opts))
-      end
+    case opts[:start] do
+      nil ->
+        drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, opts[:started_at] || DateTime.utc_now())
 
+      {name, input} ->
+        case start(repo, tx_id, name, input, owner, lease_ms, keys(opts), isolation) do
+          :existing -> PgTxn.wait(repo, tx_id, Config.get(repo, :key_wait_ms))
+          started_at -> drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, started_at)
+        end
+    end
+  end
+
+  @doc "An isolation level as stored in `txn.transactions.isolation` (nil: the database default)."
+  def isolation!(nil), do: nil
+
+  def isolation!(level) do
+    Map.get(@isolations, level) ||
+      raise ArgumentError, "pg_txn: :isolation must be :read_committed, :repeatable_read or :serializable, got #{inspect(level)}"
+  end
+
+  defp drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, started_at) do
     ctx = %{
       repo: repo,
       tx_id: tx_id,
@@ -46,13 +72,22 @@ defmodule PgTxn.Loop do
       repo_opts: Keyword.drop(opts, @own_opts),
       # every run is rolled back but the last, so the count is kept here
       runs: 0,
+      isolation: isolation,
+      run: nil,
+      # 1 while a run's database transaction is open
+      in_run: :atomics.new(1, []),
       started_at: DateTime.truncate(started_at, :millisecond)
     }
 
-    # the lease is kept for the whole time this process drives the transaction
+    # the lease is kept for the whole time this process drives the
+    # transaction, but not while a run is open: under repeatable read or
+    # serializable, the run's own update of the row would then fail to
+    # serialize
     heartbeat =
       every(max(1000, div(ctx.lease_ms, 3)), fn ->
-        SQL.all(repo, "SELECT txn.heartbeat($1::text::uuid, $2::text::uuid, $3)", [tx_id, ctx.owner, ctx.lease_ms])
+        if :atomics.get(ctx.in_run, 1) == 0 do
+          SQL.all(repo, "SELECT txn.heartbeat($1::text::uuid, $2::text::uuid, $3)", [tx_id, ctx.owner, ctx.lease_ms])
+        end
       end)
 
     Local.driving(repo, tx_id)
@@ -67,22 +102,27 @@ defmodule PgTxn.Loop do
   end
 
   # after a transaction ends, keeps only the compensation functions it
-  # actually scheduled
+  # actually scheduled; compensations this driver must run but has no
+  # function for (a transaction resumed here took another path than the
+  # process that called the effect) are leased at once, to fail as EffectLost
   defp keep_compensations(ctx) do
-    case Local.compensations(ctx.repo, ctx.tx_id) do
-      [] ->
-        :ok
+    due =
+      ctx.repo
+      |> SQL.all(
+        "SELECT compensates::text AS id FROM txn.effects WHERE tx_id = $1::text::uuid AND kind = 'compensation' AND local_owner = $2::text::uuid AND status IN ('pending', 'retry_wait', 'running')",
+        [ctx.tx_id, ctx.owner])
+      |> MapSet.new(& &1["id"])
 
-      ids ->
-        due =
-          ctx.repo
-          |> SQL.all(
-            "SELECT compensates::text AS id FROM txn.effects WHERE tx_id = $1::text::uuid AND kind = 'compensation' AND status IN ('pending', 'retry_wait', 'running')",
-            [ctx.tx_id])
-          |> MapSet.new(& &1["id"])
+    ids = Local.compensations(ctx.repo, ctx.tx_id)
+    Local.delete(ctx.repo, Enum.reject(ids, &MapSet.member?(due, &1)))
+    # a function registered by an earlier driver of this transaction (on this
+    # node) runs under this driver's lease now
+    Enum.each(due, &Local.set_owner(ctx.repo, &1, ctx.owner))
 
-        Local.delete(ctx.repo, Enum.reject(ids, &MapSet.member?(due, &1)))
-        if MapSet.size(due) > 0, do: PgTxn.Worker.wake(ctx.repo)
+    cond do
+      Enum.any?(due, &(&1 not in ids)) -> PgTxn.Worker.lease_now(ctx.repo, ctx.owner)
+      MapSet.size(due) > 0 -> PgTxn.Worker.wake(ctx.repo)
+      true -> :ok
     end
   rescue
     _ -> :ok
@@ -112,17 +152,22 @@ defmodule PgTxn.Loop do
   defp json_key(m) when is_map(m), do: Map.new(m, fn {k, v} -> {k, json_key(v)} end)
   defp json_key(v), do: v
 
-  # records the transaction as running (named, or holding keys); with a key
-  # held by another transaction, waits for that one to end first
-  defp start(repo, tx_id, name, input, owner, lease_ms, keys) do
+  # records the transaction as running (named, with keys, or with an id) and
+  # returns when it started; with a key another transaction holds, waits for
+  # that one to end first; with an id that exists already, returns :existing
+  defp start(repo, tx_id, name, input, owner, lease_ms, keys, isolation) do
     wait_ms = Config.get(repo, :key_wait_ms)
     since = System.monotonic_time(:millisecond)
 
     Stream.repeatedly(fn ->
-      SQL.one(repo, "SELECT created_at, holder::text AS holder FROM txn.start($1::text::uuid, $2, $3::text::jsonb, $4::text::uuid, $5, $6::text[])",
-        [tx_id, name, input, owner, lease_ms, keys])
+      SQL.one(repo,
+        "SELECT created_at, holder::text AS holder, existing FROM txn.start($1::text::uuid, $2, $3::text::jsonb, $4::text::uuid, $5, $6::text[], $7)",
+        [tx_id, name, input, owner, lease_ms, keys, isolation])
     end)
     |> Enum.find_value(fn
+      %{"existing" => true} ->
+        :existing
+
       %{"holder" => nil, "created_at" => created_at} ->
         created_at
 
@@ -142,9 +187,12 @@ defmodule PgTxn.Loop do
 
     outcome =
       try do
+        :atomics.put(ctx.in_run, 1, 1)
         ctx.repo.transaction(fn -> run(ctx, tx, fun) end, ctx.repo_opts)
       catch
         kind, reason -> {:caught, kind, reason, __STACKTRACE__}
+      after
+        :atomics.put(ctx.in_run, 1, 0)
       end
 
     state = Tx.close(tx)
@@ -152,7 +200,7 @@ defmodule PgTxn.Loop do
 
     if state.needs != [] do
       # a run that registered a need rolls back whatever user code did with the abort
-      perform(ctx, state)
+      perform(%{ctx | run: tx.ref}, state)
       loop(ctx, fun, retries)
     else
       finish(ctx, fun, retries, outcome, state)
@@ -160,6 +208,7 @@ defmodule PgTxn.Loop do
   end
 
   defp run(ctx, tx, fun) do
+    if ctx.isolation, do: Ecto.Adapters.SQL.query!(ctx.repo, "SET TRANSACTION ISOLATION LEVEL #{String.upcase(ctx.isolation)}")
     SQL.all(ctx.repo, "SELECT txn.attempt($1::text::uuid, $2::text::uuid)", [ctx.tx_id, ctx.owner])
     result = fun.(tx)
     state = Tx.state(tx)
@@ -216,12 +265,21 @@ defmodule PgTxn.Loop do
   # ------------------------------------------------------------------ perform
 
   # takes the lease and records the intents, then calls the needed effects
-  # outside of any transaction
+  # outside of any transaction; anything failing here fails the transaction
+  # (releasing its keys) rather than leaving it running
   defp perform(ctx, state) do
     case prepare(ctx, state.needs) do
       %{"effects" => actions} -> execute_all(ctx, state.needs, actions)
       %{"conflict" => _fenced} -> raise FencedError, tx_id: ctx.tx_id
     end
+  catch
+    :error, %FencedError{} = e ->
+      reraise e, __STACKTRACE__
+
+    kind, reason ->
+      stack = __STACKTRACE__
+      fail(ctx, Call.error_json(if kind == :error, do: reason, else: %{"name" => to_string(kind), "message" => inspect(reason)}))
+      :erlang.raise(kind, reason, stack)
   end
 
   defp prepare(ctx, needs) do
@@ -279,7 +337,7 @@ defmodule PgTxn.Loop do
     call_ctx = %{effect_id: id, idempotency_key: id, attempt: attempt, tx_id: ctx.tx_id}
     fun = need.fun
     thunk = if is_function(fun, 0), do: fun, else: fn -> fun.(call_ctx) end
-    o = Call.call(thunk, retry: !!need.opts[:retry], timeout_ms: Keyword.get(need.opts, :timeout_ms, 30_000))
+    o = Call.call(thunk, retry: !!need.opts[:retry], timeout_ms: Keyword.get(need.opts, :timeout_ms, 30_000), run: ctx.run)
 
     done =
       SQL.value(ctx.repo,

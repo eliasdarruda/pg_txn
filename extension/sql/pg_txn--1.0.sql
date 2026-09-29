@@ -45,6 +45,7 @@ CREATE TABLE txn.transactions (
     id          uuid PRIMARY KEY,
     name        text,                   -- NULL: inline (not resumable by another process)
     keys        text[],                 -- the keys it runs under (see txn.keys)
+    isolation   text,                   -- its runs' isolation level (NULL: the database default)
     input       jsonb,                  -- named transactions: their input
     status      text NOT NULL DEFAULT 'running'
                 CHECK (status IN ('running', 'committed', 'failed', 'abandoned')),
@@ -184,6 +185,9 @@ DECLARE
     id uuid := coalesce(p_id, pg_catalog.gen_random_uuid());
     tx uuid;
 BEGIN
+    IF p_owner IS NULL THEN
+        RAISE EXCEPTION 'pg_txn: spawn needs the owner process that has its function' USING ERRCODE = 'null_value_not_allowed';
+    END IF;
     SELECT t.id INTO tx FROM txn.transactions t WHERE t.id = txn._current();
     INSERT INTO txn.effects (id, tx_id, kind, name, input, max_attempts, delivery, next_attempt_at, local_owner)
     VALUES (id, tx, 'spawn', p_name, '{}', p_max_attempts, p_delivery,
@@ -195,13 +199,16 @@ END $$;
 -- A named transaction that runs in the background (on any process that
 -- defines it) iff the surrounding transaction commits.
 CREATE FUNCTION txn.enqueue(p_name text, p_input jsonb DEFAULT '{}', p_id uuid DEFAULT NULL,
-                            p_keys text[] DEFAULT NULL)
+                            p_keys text[] DEFAULT NULL, p_isolation text DEFAULT NULL)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE
     id uuid := coalesce(p_id, pg_catalog.gen_random_uuid());
 BEGIN
-    INSERT INTO txn.transactions (id, name, input, keys, owner, lease_until)
-    VALUES (id, p_name, coalesce(p_input, '{}'), p_keys, NULL, txn._now())
+    IF p_name IS NULL THEN
+        RAISE EXCEPTION 'pg_txn: enqueue needs the name of a defined transaction' USING ERRCODE = 'null_value_not_allowed';
+    END IF;
+    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, lease_until)
+    VALUES (id, p_name, coalesce(p_input, '{}'), p_keys, p_isolation, NULL, txn._now())
     ON CONFLICT ON CONSTRAINT transactions_pkey DO NOTHING;
     PERFORM pg_catalog.pg_notify('txn_effects', p_name);
     RETURN id;
@@ -465,29 +472,37 @@ END $$;
 
 -- Starts a transaction driven by this process: a named one (resumable by
 -- any process that defines it if this one stops), or an inline one with
--- keys. If another transaction holds one of the keys, nothing is started and
--- holder is that transaction: wait for it to end, then start again.
+-- keys or a caller-chosen id. If another transaction holds one of the keys,
+-- nothing is started and holder is that transaction: wait for it to end,
+-- then start again. If a transaction with this id exists already (it ran,
+-- or runs now: idempotent ids), nothing is started and existing is true:
+-- wait for its outcome instead of running it again.
 CREATE FUNCTION txn.start(p_tx uuid, p_name text, p_input jsonb, p_owner uuid, p_lease_ms integer,
-                          p_keys text[] DEFAULT NULL)
-RETURNS TABLE (created_at timestamptz, holder uuid)
+                          p_keys text[] DEFAULT NULL, p_isolation text DEFAULT NULL)
+RETURNS TABLE (created_at timestamptz, holder uuid, existing boolean)
 LANGUAGE plpgsql AS $$
 DECLARE
     t txn.transactions;
     h uuid;
 BEGIN
-    INSERT INTO txn.transactions (id, name, input, keys, owner, generation, lease_until)
-    VALUES (p_tx, p_name, p_input, p_keys, p_owner, 1,
+    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, generation, lease_until)
+    VALUES (p_tx, p_name, p_input, p_keys, p_isolation, p_owner, 1,
             txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    ON CONFLICT (id) DO NOTHING
     RETURNING * INTO t;
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT NULL::timestamptz, NULL::uuid, true;
+        RETURN;
+    END IF;
     IF p_keys IS NOT NULL THEN
         h := txn._claim(p_tx, p_keys);
         IF h IS NOT NULL THEN
             DELETE FROM txn.transactions x WHERE x.id = p_tx;
-            RETURN QUERY SELECT NULL::timestamptz, h;
+            RETURN QUERY SELECT NULL::timestamptz, h, false;
             RETURN;
         END IF;
     END IF;
-    RETURN QUERY SELECT t.created_at, NULL::uuid;
+    RETURN QUERY SELECT t.created_at, NULL::uuid, false;
 END $$;
 
 -- ---------------------------------------------------------------------------
@@ -656,7 +671,7 @@ END $$;
 -- process runs them again; recorded effects are reused.
 CREATE FUNCTION txn.lease_transactions(p_owner uuid, p_names text[], p_max integer DEFAULT 16,
                                        p_lease_ms integer DEFAULT 30000)
-RETURNS TABLE (id uuid, name text, input jsonb, runs integer, created_at timestamptz)
+RETURNS TABLE (id uuid, name text, input jsonb, runs integer, created_at timestamptz, isolation text)
 LANGUAGE plpgsql AS $$
 DECLARE
     c record;
@@ -680,7 +695,7 @@ BEGIN
            SET owner = p_owner, generation = t.generation + 1, updated_at = txn._now(),
                lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0)
          WHERE t.id = c.id
-        RETURNING t.id, t.name, t.input, t.runs, t.created_at;
+        RETURNING t.id, t.name, t.input, t.runs, t.created_at, t.isolation;
         n := n + 1;
     END LOOP;
 END $$;

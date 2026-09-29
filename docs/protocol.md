@@ -30,10 +30,11 @@ else as its JSON text.
 ## A transaction
 
 ```
-tx_id := new uuid; owner := this process's uuid
-if keys:                                           -- optional: run one at a time per key
+tx_id := the caller's id, or a new uuid; owner := this process's uuid
+if an id was given, or keys:
   loop:
-    (created_at, holder) := SELECT * FROM txn.start(tx_id, NULL, NULL, owner, lease_ms, keys)
+    (created_at, holder, existing) := SELECT * FROM txn.start(tx_id, NULL, NULL, owner, lease_ms, keys, isolation)
+    existing → wait for txn.status(tx_id) to end; return its output or raise its error (idempotent ids)
     holder is NULL → break                         -- all keys claimed at once
     wait until txn.status(holder) is not 'running' (up to key_wait_ms), loop
 loop:
@@ -42,7 +43,7 @@ loop:
     SELECT txn.attempt(tx_id, owner)               -- marks the session; fenced check
     result := user_function(tx)                    -- tx.effect / tx.spawn below
     if run.needs not empty: ROLLBACK, goto perform
-    SELECT txn.finish(tx_id, owner, run.consumed, output)   -- releases the keys
+    SELECT txn.finish(tx_id, owner, run.consumed, output, runs)   -- releases the keys
   COMMIT → return result
   on error:
     run.needs not empty          → perform
@@ -87,7 +88,7 @@ catches the abort.
 ### perform (outside any transaction)
 
 ```
-heartbeat every lease/3: SELECT txn.heartbeat(tx_id, owner, lease_ms)
+heartbeat every lease/3, not while a run is open: SELECT txn.heartbeat(tx_id, owner, lease_ms)
 r := SELECT txn.prepare_effects(tx_id, owner, lease_ms, effects)
      effects: [{seq, name, input: deps, max_attempts, delivery, compensation}]
   r.conflict (fenced) → stop
@@ -97,8 +98,14 @@ for each r.effects[i] (concurrently):
   'execute' → call fn({effectId: id, attempt}) with a timeout
               SELECT txn.effect_done(id, owner, ok, result, error, retryable, retry_after_ms)
               'retry_wait' → sleep wait_ms, prepare this effect again
+              a result that cannot be encoded → record it failed, not retryable
 loop
+any error here → SELECT txn.fail_transaction(tx_id, owner, error, runs); rethrow
 ```
+
+A run is closed before its ROLLBACK (or COMMIT): queries a still-running
+branch of user code issues through `tx` after that must be refused, or they
+would run outside the transaction.
 
 Retries are opt-in: clients send `max_attempts` 1 and delivery
 `at-most-once` unless the application asked for retries, then `max_attempts`
@@ -127,7 +134,7 @@ outcome is stored, all in the application's commit.
 - `txn.enqueue(name, input, id, keys)`: a named transaction that runs in the
   background iff the surrounding transaction commits; with keys, when none
   of them is held (`lease_transactions` claims them).
-- Named transactions started in-process: `txn.start(tx_id, name, input, owner, lease_ms, keys)`,
+- Named transactions started in-process: `txn.start(tx_id, name, input, owner, lease_ms, keys, isolation)`,
   then the loop above. If the process stops, the lease expires; the process
   that resumes it keeps its keys.
 

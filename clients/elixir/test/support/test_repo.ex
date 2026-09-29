@@ -27,3 +27,10 @@ defmodule PgTxn.ImpatientRepo do
   use Ecto.Repo, otp_app: :pg_txn, adapter: Ecto.Adapters.Postgres
   use PgTxn.Repo, key_wait_ms: 200
 end
+
+defmodule PgTxn.SweepRepo do
+  @moduledoc false
+  # started by tests: frequent maintenance, short function lifetimes
+  use Ecto.Repo, otp_app: :pg_txn, adapter: Ecto.Adapters.Postgres
+  use PgTxn.Repo, poll_ms: 20, maintain_ms: 50, forget_after_ms: 100, forget_invisible_ms: 1_000
+end

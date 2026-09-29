@@ -98,7 +98,7 @@ defmodule PgTxn.Tx do
 
   defp state!(tx) do
     cond do
-      Process.get(PgTxn.Call.in_effect_key()) ->
+      Process.get(PgTxn.Call.in_effect_key()) == tx.ref ->
         raise ArgumentError,
               "pg_txn: tx cannot be used inside an effect's or a spawned function: it runs outside the transaction. Return what you need from the effect and use it after"
 

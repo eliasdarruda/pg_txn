@@ -8,13 +8,60 @@ defmodule PgTxn.Local do
   #
   #   {id, kind, owner, tx_id, since_ms, fun, timeout_ms}   kind: :spawn | :compensation
   #   {{:driving, tx_id}, pid}
+  #   {:calls, n}              public calls in progress (transaction/3, run/4)
+  #   {:closing, true}         the worker is shutting down: new calls are refused
 
   @doc false
   def table(repo), do: Module.concat(repo, PgTxnLocal)
 
   @doc false
   def new(repo) do
-    :ets.new(table(repo), [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
+    t = :ets.new(table(repo), [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
+    :ets.insert(t, {:calls, 0})
+    t
+  end
+
+  @doc "Raises unless the Repo's worker runs and is not shutting down."
+  def open!(repo) do
+    t = table(repo)
+
+    cond do
+      :ets.whereis(t) == :undefined ->
+        raise ArgumentError,
+              "pg_txn: no PgTxn.Worker is running for #{inspect(repo)} (it stopped, or was never started: use PgTxn.Repo, or start {PgTxn.Worker, repo: #{inspect(repo)}})"
+
+      :ets.member(t, :closing) ->
+        raise ArgumentError, "pg_txn: #{inspect(repo)}'s PgTxn.Worker is shutting down: new transactions, spawns and enqueues are refused"
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc "Runs a public call (the worker's shutdown waits for it)."
+  def active(repo, fun) do
+    open!(repo)
+    :ets.update_counter(table(repo), :calls, 1)
+
+    try do
+      fun.()
+    after
+      try do
+        :ets.update_counter(table(repo), :calls, -1)
+      rescue
+        ArgumentError -> :ok
+      end
+    end
+  end
+
+  def closing(repo), do: :ets.insert(table(repo), {:closing, true})
+
+  @doc "Public calls in progress plus transactions driven now."
+  def busy(repo) do
+    t = table(repo)
+    [{:calls, calls}] = :ets.lookup(t, :calls)
+    drives = t |> :ets.match({{:driving, :_}, :"$1"}) |> List.flatten() |> Enum.count(&Process.alive?/1)
+    calls + drives
   end
 
   @doc "Registers `fun.(ctx, input)` under effect id `id` (the worker's owner `owner` leases it)."
@@ -38,6 +85,13 @@ defmodule PgTxn.Local do
     end
 
     put(repo, effect_id, :compensation, owner, tx_id, fun, opts[:timeout_ms])
+  end
+
+  @doc "Makes `owner` the one whose lease runs the function `id` (its row's `local_owner`)."
+  def set_owner(repo, id, owner) do
+    :ets.update_element(table(repo), id, {3, owner})
+  rescue
+    ArgumentError -> false
   end
 
   def get(repo, id) do
@@ -71,15 +125,15 @@ defmodule PgTxn.Local do
     ArgumentError -> []
   end
 
-  @doc "Ids registered more than `age_ms` ago, except those of transactions driven now."
+  @doc "`{id, age_ms}` of functions registered more than `age_ms` ago, except those of transactions driven now."
   def older_than(repo, age_ms) do
     t = table(repo)
-    cutoff = now() - age_ms
+    now = now()
 
     t
-    |> :ets.select([{{:"$1", :_, :_, :"$2", :"$3", :_, :_}, [{:<, :"$3", cutoff}], [{{:"$1", :"$2"}}]}])
-    |> Enum.reject(fn {_id, tx_id} -> tx_id && driving?(t, tx_id) end)
-    |> Enum.map(&elem(&1, 0))
+    |> :ets.select([{{:"$1", :_, :_, :"$2", :"$3", :_, :_}, [{:<, :"$3", now - age_ms}], [{{:"$1", :"$2", :"$3"}}]}])
+    |> Enum.reject(fn {_id, tx_id, _since} -> tx_id && driving?(t, tx_id) end)
+    |> Enum.map(fn {id, _tx_id, since} -> {id, now - since} end)
   end
 
   def driving(repo, tx_id) do

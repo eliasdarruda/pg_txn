@@ -64,6 +64,7 @@ committed and completed effects are compensated.
 |---|---|---|
 | `:key` | none | transactions with the same key run one at a time; the others wait, holding nothing |
 | `:keys` | none | several keys, claimed all at once or none (no deadlocks), e.g. `keys: [{"account", from}, {"account", to}]` |
+| `:isolation` | the database's | `:read_committed`, `:repeatable_read` or `:serializable`, for every run |
 | `:id` | a new uuid | the transaction id; idempotent: an id that already exists is not run again, its outcome is returned (`{:ok, output}`, or `{:error, %PgTxn.TransactionFailedError{}}`) |
 
 A key is a string, used as is, or any JSON-able term: `{"order", 42}` and
@@ -73,7 +74,11 @@ other clients. A transaction that waits longer than `:key_wait_ms` raises
 
 Use `tx` only in the transaction function, in the process running it. Using it
 inside an effect's or a spawned function, or after the transaction ended,
-raises an `ArgumentError`.
+raises an `ArgumentError`. Those functions may start transactions of their own.
+
+When the Repo stops, its worker stops taking background transactions and
+refuses new calls, but lets the transactions in progress, and their spawns
+and compensations, finish (up to `:drain_ms`).
 
 ### `PgTxn.effect(tx, fun, opts)`
 
@@ -129,7 +134,8 @@ id = PgTxn.enqueue(Repo, "settle", %{invoice_id: 7})         # on any node that 
 PgTxn.wait(Repo, id)
 ```
 
-`run/4`, `enqueue/4` and `PgTxn.Multi.enqueue` take `:key` and `:keys` too.
+`run/4`, `enqueue/4` and `PgTxn.Multi.enqueue` take `:key`, `:keys` and
+`:isolation` too (an enqueued transaction runs at its level wherever it runs).
 An enqueued transaction starts once no other transaction holds its keys.
 
 ### `PgTxn.now(tx)` and `PgTxn.uuid(tx)`

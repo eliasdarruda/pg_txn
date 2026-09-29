@@ -74,7 +74,13 @@ export function errorJson(e: unknown): EffectError {
     }
     return out;
   }
-  return { name: "Error", message: typeof e === "string" ? e : JSON.stringify(e) ?? String(e) };
+  let message: string;
+  try {
+    message = typeof e === "string" ? e : JSON.stringify(e) ?? String(e);
+  } catch {
+    message = String(e); // a bigint, a cyclic object, …
+  }
+  return { name: "Error", message };
 }
 
 export function sqlState(e: unknown): string | undefined {

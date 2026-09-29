@@ -287,7 +287,7 @@ while it runs.
 docker compose --profile matrix up -d     # PostgreSQL 18 and 14, PgBouncer
 npm install
 scripts/test-all.sh                       # every suite, with a summary
-ONLY="unit core" scripts/test-all.sh      # groups: unit core compat bun elixir pack
+ONLY="unit core" scripts/test-all.sh      # groups: unit core adversarial compat bun elixir pack
 ```
 
 ```
@@ -295,6 +295,7 @@ extension/sql/          the schema: the database side of pg_txn
 clients/typescript/     @pg-txn/client, @pg-txn/drizzle, @pg-txn/knex
 clients/elixir/         PgTxn, PgTxn.Repo, PgTxn.Multi
 tests/core/             transactions, spawns, concurrency and keys, composition, crash recovery
+tests/adversarial/      races, crashes, misuse, poolers: regressions for bugs found by review
 tests/performance/      benchmark
 docs/                   protocol, operations
 ```

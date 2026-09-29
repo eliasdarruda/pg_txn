@@ -47,7 +47,10 @@ even then belongs in an enqueued defined transaction.
   their idempotency key. An inline `transaction(fn)` cannot be resumed
   elsewhere: it is marked abandoned and its keys are released; the
   compensation functions of its completed effects died with the process,
-  so those are reported as `EffectLost`.
+  so those are reported as `EffectLost`. The same happens to a named
+  transaction resumed elsewhere whose re-run takes another path than the
+  process that called an effect: the effect's compensation function is not
+  in the resuming process.
 - **Connections.** A run holds one connection while your function runs
   between effects (milliseconds); effects hold none. The worker uses the
   pool for short statements plus, with `listen`, one dedicated connection.

@@ -151,11 +151,14 @@ type Need = { seq: number; name: string; tagged: unknown; fn: (ctx: EffectContex
 type Local = { fn: (ctx: EffectContext, input: any) => unknown; timeoutMs?: number; since: number; txId: string | null; compensation: boolean };
 type Action = { seq: number; id: string; action: "execute" | "wait" | "done"; attempt: number; wait_ms: number };
 
-// set while an effect's or a spawned function runs: tx must not be used there
-const inEffect = new AsyncLocalStorage<boolean>();
+// the run whose effect is running: its tx must not be used there (other
+// transactions, e.g. one started by a spawned function, may)
+const inEffect = new AsyncLocalStorage<object | null>();
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-const json = (v: unknown) => JSON.stringify(toTagged(v === undefined ? null : v));
+const json = (v: unknown) => JSON.stringify(toTagged(v));
+// pg_txn transactions live seconds to minutes: a longer retry delay fails the effect instead
+const MAX_RETRY_AFTER_MS = 15 * 60_000;
 
 const keyText = (k: TxKey) => (typeof k === "string" ? k : JSON.stringify(k));
 const keysOf = (o: { key?: TxKey; keys?: readonly TxKey[] }) => {
@@ -165,6 +168,20 @@ const keysOf = (o: { key?: TxKey; keys?: readonly TxKey[] }) => {
 
 const spawnParams = (owner: string, fn: Function, id: string, o: SpawnOptions) =>
   [owner, o.name ?? (fn.name || "spawn"), id, attemptsOf(o.retry), deliveryOf(o.retry), o.delayMs ?? 0];
+
+type Outcome = { ok: boolean; result: unknown; error: unknown; retryable: boolean; retryAfterMs?: number };
+
+// An outcome whose result can be stored; a result that cannot (a Map, a
+// string with U+0000, …) becomes a permanent failure of the effect.
+function storable(o: Outcome): Outcome & { stored?: string } {
+  if (!o.ok) return o;
+  try {
+    return { ...o, stored: json(o.result) };
+  } catch (e) {
+    return { ok: false, result: undefined, retryable: false, retryAfterMs: undefined,
+      error: { ...errorJson(e), message: `the effect's result cannot be stored: ${(e as Error).message}` } };
+  }
+}
 
 function stableUuid(seed: string): string {
   const h = createHash("sha256").update(seed).digest("hex").split("");
@@ -197,6 +214,9 @@ class Run<T> implements Tx<T> {
 
   get db(): T {
     this.#check();
+    // a sibling branch still running after this run was aborted: its queries
+    // would run outside the transaction, after its ROLLBACK
+    if (this.closed) throw new NeedEffect();
     return this.#db;
   }
 
@@ -205,7 +225,7 @@ class Run<T> implements Tx<T> {
   }
 
   #check(): void {
-    if (inEffect.getStore()) {
+    if (inEffect.getStore() === this) {
       throw new Error("pg_txn: tx cannot be used inside an effect's or a spawned function: it runs outside the transaction. Return what you need from the effect and use it after");
     }
     if (this.ended) throw new Error("pg_txn: this transaction has ended; tx cannot be used after it");
@@ -282,6 +302,9 @@ export class PgTxn<T = any> {
   #definitions = new Map<string, (tx: Tx<T>, input: any) => unknown>();
   #ready: Promise<void> | null = null;
   #closed = false;
+  #closing = false;
+  #leaseNow = false;
+  #calls = 0;
   #wake: (() => void) | null = null;
   #worker: Promise<void> | null = null;
   #unlisten: (() => Promise<void>) | null = null;
@@ -311,7 +334,11 @@ export class PgTxn<T = any> {
 
   /** Installs (if allowed) and checks the txn schema; runs once. */
   ready(): Promise<void> {
-    this.#ready ??= this.#install();
+    // a failed install is tried again on the next call (e.g. the database was briefly down)
+    this.#ready ??= this.#install().catch((e) => {
+      this.#ready = null;
+      throw e;
+    });
     return this.#ready;
   }
 
@@ -363,26 +390,29 @@ export class PgTxn<T = any> {
    * throws its error) without running fn again.
    */
   async transaction<R>(fn: (tx: Tx<T>) => Promise<R> | R, options: RunOptions = {}): Promise<R> {
-    await this.ready();
-    if (options.id !== undefined) {
-      // idempotent by id: a transaction that already ended is not run again
-      const done = await this.#ended<R>(options.id);
-      if (done) return done.output;
-    }
-    const id = options.id ?? randomUUID();
-    if (!keysOf(options)) return this.#drive(id, (tx) => fn(tx), new Date(), options);
-    const startedAt = await this.#start(id, null, null, options);
-    return this.#drive(id, (tx) => fn(tx), startedAt, options);
+    return this.#active(async () => {
+      await this.ready();
+      const id = options.id ?? randomUUID();
+      // without an id or keys there is nothing to arbitrate: no durable record until an effect
+      if (options.id === undefined && !keysOf(options)) return this.#drive(id, (tx) => fn(tx), new Date(), options);
+      const started = await this.#start(id, null, null, options);
+      if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
+      return this.#drive(id, (tx) => fn(tx), started, options);
+    });
   }
 
-  // Records the transaction as running (named, or holding keys); with a key
-  // held by another transaction, waits for that one to end first.
-  async #start(id: string, name: string | null, input: unknown, options: RunOptions): Promise<Date> {
+  // Records the transaction as running (named, with keys, or with an id) and
+  // returns when it started. With a key another transaction holds, waits for
+  // that one to end first; with an id that exists already (it ran, or runs
+  // now elsewhere), returns "existing": wait for its outcome instead.
+  async #start(id: string, name: string | null, input: unknown, options: RunOptions): Promise<Date | "existing"> {
     const keys = keysOf(options);
     const since = Date.now();
     for (;;) {
-      const r = (await this.db.query(null, "SELECT created_at, holder FROM txn.start($1, $2, $3::jsonb, $4, $5, $6::text[])",
-        [id, name, name === null ? null : json(input), this.owner, this.#opts.leaseMs, keys])).rows[0];
+      const r = (await this.db.query(null,
+        "SELECT created_at, holder, existing FROM txn.start($1, $2, $3::jsonb, $4, $5, $6::text[], $7)",
+        [id, name, name === null ? null : json(input), this.owner, this.#opts.leaseMs, keys, options.isolation ?? null])).rows[0];
+      if (r.existing) return "existing";
       if (!r.holder) return new Date(r.created_at);
       await this.#waitFor(r.holder, () => {
         if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys!.join(", "), r.holder, Date.now() - since);
@@ -394,10 +424,13 @@ export class PgTxn<T = any> {
   async run<R = unknown>(name: string, input: unknown, options: RunOptions = {}): Promise<R> {
     const fn = this.#definitions.get(name);
     if (!fn) throw new Error(`pg_txn: no transaction named ${name} is defined in this process`);
-    await this.ready();
-    const id = options.id ?? randomUUID();
-    const startedAt = await this.#start(id, name, input, options);
-    return this.#drive(id, (tx) => fn(tx, input), startedAt, options) as Promise<R>;
+    return this.#active(async () => {
+      await this.ready();
+      const id = options.id ?? randomUUID();
+      const started = await this.#start(id, name, input, options);
+      if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
+      return this.#drive(id, (tx) => fn(tx, input), started, options) as Promise<R>;
+    });
   }
 
   /**
@@ -405,10 +438,12 @@ export class PgTxn<T = any> {
    * defines it. With trx (a database transaction), it is queued iff that commits.
    * With keys, it runs when no other transaction holds any of them.
    */
-  async enqueue(name: string, input: unknown, options: { trx?: T; id?: string; key?: TxKey; keys?: readonly TxKey[] } = {}): Promise<string> {
+  async enqueue(name: string, input: unknown,
+                options: { trx?: T; id?: string; key?: TxKey; keys?: readonly TxKey[]; isolation?: TransactionOptions["isolation"] } = {}): Promise<string> {
+    this.#open();
     await this.ready();
-    const r = await this.db.query(options.trx ?? null, "SELECT txn.enqueue($1, $2::jsonb, $3, $4::text[]) AS id",
-      [name, json(input), options.id ?? null, keysOf(options)]);
+    const r = await this.db.query(options.trx ?? null, "SELECT txn.enqueue($1, $2::jsonb, $3, $4::text[], $5) AS id",
+      [name, json(input), options.id ?? null, keysOf(options), options.isolation ?? null]);
     this.#wake?.();
     return r.rows[0].id;
   }
@@ -419,6 +454,7 @@ export class PgTxn<T = any> {
    */
   async spawn(fn: (ctx: EffectContext) => unknown, options: SpawnOptions & { trx?: T } = {}): Promise<string> {
     if (typeof fn !== "function") throw new TypeError("pgtxn.spawn(fn, options?): fn must be a function");
+    this.#open();
     await this.ready();
     const id = randomUUID();
     this._local(id, fn, options.timeoutMs, null, false);
@@ -427,13 +463,19 @@ export class PgTxn<T = any> {
     return id;
   }
 
-  // The outcome of a transaction that ended (its output, or its error thrown),
-  // after waiting for it if another process is running it; null if unknown.
-  async #ended<R>(id: string): Promise<{ output: R } | null> {
-    const r = (await this.db.query(null, "SELECT status, owner FROM txn.transactions WHERE id = $1", [id])).rows[0];
-    if (!r) return null;
-    if (r.status === "running" && r.owner === this.owner) return null;
-    return { output: await this.wait<R>(id, this.#opts.keyWaitMs) };
+  #open(): void {
+    if (this.#closing) throw new Error("pg_txn: this PgTxn is closed");
+  }
+
+  // Runs a public call, so that close() waits for it.
+  async #active<R>(f: () => Promise<R>): Promise<R> {
+    this.#open();
+    this.#calls++;
+    try {
+      return await f();
+    } finally {
+      this.#calls--;
+    }
   }
 
   /** Waits for a transaction (e.g. an enqueued one) and returns its output. */
@@ -450,13 +492,17 @@ export class PgTxn<T = any> {
 
   async #drive(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
     // keeps the lease for as long as this process drives the transaction (a
-    // no-op until the transaction has a durable record)
+    // no-op until the transaction has a durable record); not while a run is
+    // open: under repeatable read or serializable, the run's own update of
+    // the row would then fail to serialize
+    const state = { inRun: false };
     const heartbeat = setInterval(() => {
+      if (state.inRun) return;
       this.db.query(null, "SELECT txn.heartbeat($1, $2, $3)", [txId, this.owner, this.#opts.leaseMs]).catch(() => {});
     }, Math.max(1000, this.#opts.leaseMs / 3));
     this.#driving.add(txId);
     try {
-      return await this.#runs(txId, fn, startedAt, options);
+      return await this.#runs(txId, fn, startedAt, options, state);
     } finally {
       clearInterval(heartbeat);
       this.#driving.delete(txId);
@@ -465,32 +511,41 @@ export class PgTxn<T = any> {
   }
 
   // After a transaction ends, keeps only the compensation functions it
-  // actually scheduled.
+  // actually scheduled; compensations this process must run but has no
+  // function for (a transaction resumed here took another path than the
+  // process that called the effect) are failed as EffectLost at once.
   async #keepCompensations(txId: string): Promise<void> {
-    const comps = [...this.#local].filter(([, l]) => l.txId === txId && l.compensation);
-    if (!comps.length) return;
     const due = new Set((await this.db.query(null,
-      "SELECT compensates::text AS id FROM txn.effects WHERE tx_id = $1 AND kind = 'compensation' AND status IN ('pending', 'retry_wait', 'running')",
-      [txId]).catch(() => ({ rows: [] }))).rows.map((r: any) => r.id));
-    for (const [id] of comps) if (!due.has(id)) this.#local.delete(id);
-    if (due.size) this.#wake?.();
+      "SELECT compensates::text AS id FROM txn.effects WHERE tx_id = $1 AND kind = 'compensation' AND local_owner = $2 AND status IN ('pending', 'retry_wait', 'running')",
+      [txId, this.owner]).catch(() => ({ rows: [] }))).rows.map((r: any) => r.id));
+    for (const [id, l] of this.#local) if (l.txId === txId && l.compensation && !due.has(id)) this.#local.delete(id);
+    if (due.size) {
+      if ([...due].some((id) => !this.#local.has(id))) this.#leaseNow = true;
+      this.#wake?.();
+    }
   }
 
-  async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
+  async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions, state: { inRun: boolean }): Promise<any> {
     let retries = 0;
     let runs = 0;
     for (;;) {
       const run = new Run<T>(this, txId, startedAt);
       runs++;
       try {
+        state.inRun = true;
         const out = await this.db.transaction(async (trx) => {
           run.db = trx;
-          await this.db.query(trx, "SELECT txn.attempt($1, $2)", [txId, this.owner]);
-          const result = await fn(run);
-          if (run.needs.length) throw new NeedEffect();
-          await this.db.query(trx, "SELECT txn.finish($1, $2, $3::uuid[], $4::jsonb, $5)", [txId, this.owner, run.consumed, json(result), runs]);
-          return result;
-        }, options);
+          try {
+            await this.db.query(trx, "SELECT txn.attempt($1, $2)", [txId, this.owner]);
+            const result = await fn(run);
+            if (run.needs.length) throw new NeedEffect();
+            await this.db.query(trx, "SELECT txn.finish($1, $2, $3::uuid[], $4::jsonb, $5)", [txId, this.owner, run.consumed, json(result), runs]);
+            return result;
+          } finally {
+            // before the COMMIT or ROLLBACK: from now on this run's tx refuses queries
+            run.closed = true;
+          }
+        }, options).finally(() => { state.inRun = false; });
         run.closed = true;
         run.ended = true;
         if (run.spawned.length) this.#wake?.();
@@ -499,7 +554,16 @@ export class PgTxn<T = any> {
         run.closed = true;
         for (const id of run.spawned) this.#local.delete(id);
         if (run.needs.length) {
-          await this.#perform(txId, run);
+          try {
+            await this.#perform(txId, run);
+          } catch (pe) {
+            run.ended = true;
+            if (!(pe instanceof FencedError)) {
+              await this.db.query(null, "SELECT txn.fail_transaction($1, $2, $3::jsonb, $4)", [txId, this.owner, JSON.stringify(errorJson(pe)), runs])
+                .catch(() => {});
+            }
+            throw pe;
+          }
           continue;
         }
         const state = sqlState(e);
@@ -534,17 +598,18 @@ export class PgTxn<T = any> {
   async #perform(txId: string, run: Run<T>): Promise<void> {
     const prep = await this.#prepare(txId, run.needs);
     if (prep.conflict) throw new FencedError(txId);
-    await Promise.all(prep.effects!.map((a) => this.#execute(txId, run.needs.find((n) => n.seq === a.seq)!, a)));
+    await Promise.all(prep.effects!.map((a) => this.#execute(txId, run.needs.find((n) => n.seq === a.seq)!, a, run)));
   }
 
-  async #execute(txId: string, need: Need, action: Action): Promise<void> {
+  async #execute(txId: string, need: Need, action: Action, run: object): Promise<void> {
     if (need.options.compensate) this._compensation(action.id, need.options, txId);
     for (;;) {
       if (action.action === "done") return;
       if (action.action === "execute") {
-        const outcome = await this.#call(need.fn, { retry: !!need.options.retry, timeoutMs: need.options.timeoutMs }, action.id, action.attempt, txId);
+        const outcome = storable(await this.#call(need.fn, { retry: !!need.options.retry, timeoutMs: need.options.timeoutMs },
+          action.id, action.attempt, txId, run));
         const done = (await this.db.query(null, "SELECT txn.effect_done($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7) AS r",
-          [action.id, this.owner, outcome.ok, outcome.ok ? json(outcome.result) : null,
+          [action.id, this.owner, outcome.ok, outcome.ok ? outcome.stored : null,
             outcome.ok ? null : JSON.stringify(outcome.error), outcome.retryable, outcome.retryAfterMs ?? null])).rows[0].r;
         if (done.status !== "retry_wait") return;
         await sleep(done.wait_ms);
@@ -557,7 +622,8 @@ export class PgTxn<T = any> {
     }
   }
 
-  async #call(fn: (ctx: EffectContext) => unknown, options: { retry: boolean; timeoutMs?: number }, effectId: string, attempt: number, txId: string | null) {
+  async #call(fn: (ctx: EffectContext) => unknown, options: { retry: boolean; timeoutMs?: number }, effectId: string, attempt: number,
+              txId: string | null, run: object | null) {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const ctrl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -570,14 +636,23 @@ export class PgTxn<T = any> {
 
     try {
       const result = await Promise.race([
-        inEffect.run(true, () => Promise.resolve().then(() => fn({ effectId, idempotencyKey: effectId, attempt, signal: ctrl.signal, txId }))),
+        inEffect.run(run, () => Promise.resolve().then(() => fn({ effectId, idempotencyKey: effectId, attempt, signal: ctrl.signal, txId }))),
         timeout,
       ]);
       return { ok: true as const, result, error: null, retryable: false, retryAfterMs: undefined };
     } catch (e) {
-      const retryable = options.retry && !(e instanceof PermanentError);
-      return { ok: false as const, result: undefined, error: errorJson(e), retryable,
-        retryAfterMs: e instanceof RetryableError ? e.retryAfterMs : undefined };
+      let retryable = options.retry && !(e instanceof PermanentError);
+      const error = errorJson(e);
+      let after: number | undefined;
+      if (e instanceof RetryableError && e.retryAfterMs !== undefined) {
+        if (Number.isFinite(e.retryAfterMs) && e.retryAfterMs <= MAX_RETRY_AFTER_MS) {
+          after = Math.max(0, Math.round(e.retryAfterMs));
+        } else {
+          retryable = false;
+          error.message += ` (retryAfterMs ${e.retryAfterMs} is beyond the ${MAX_RETRY_AFTER_MS} ms a transaction may wait)`;
+        }
+      }
+      return { ok: false as const, result: undefined, error, retryable, retryAfterMs: after };
     } finally {
       clearTimeout(timer);
     }
@@ -626,13 +701,19 @@ export class PgTxn<T = any> {
           await this.db.query(null, "SELECT txn.worker_seen($1, $2::jsonb)",
             [this.owner, JSON.stringify({ runtime: typeof (globalThis as any).Bun !== "undefined" ? "bun" : "node", pid: process.pid, defines: defs })]);
         }
+        let tick = false;
         if (now - lastSweep > 5_000) {
           lastSweep = now;
+          tick = true;
           await this.db.query(null, "SELECT txn.abandon_expired(), txn.expire_effect_leases(), txn.fail_lost_effects()", []);
           await this.#sweepLocal();
         }
         const free = this.#opts.concurrency - running;
-        if (this.#local.size && free > 0) {
+        // on the tick too: effects of this process it no longer has a
+        // function for (e.g. a compensation scheduled by a resumed
+        // transaction) are failed as EffectLost instead of waiting forever
+        if ((this.#local.size || tick || this.#leaseNow) && free > 0) {
+          this.#leaseNow = false;
           // a trickle of work (the last lease got less than it asked for):
           // wait a moment so one lease picks up several effects
           if (trickle) await sleep(2);
@@ -648,15 +729,15 @@ export class PgTxn<T = any> {
           }
         }
         const free2 = this.#opts.concurrency - running;
-        if (defs.length && free2 > 0) {
-          const rows = (await this.db.query(null, "SELECT id, name, input, created_at FROM txn.lease_transactions($1, $2::text[], $3, $4)",
+        if (defs.length && free2 > 0 && !this.#closing) {
+          const rows = (await this.db.query(null, "SELECT id, name, input, created_at, isolation FROM txn.lease_transactions($1, $2::text[], $3, $4)",
             [this.owner, defs, free2, this.#opts.leaseMs])).rows;
           found += rows.length;
           for (const t of rows) {
             const fn = this.#definitions.get(t.name)!;
             const input = fromTagged(t.input);
             running++;
-            this.#track(this.#drive(t.id, (tx) => fn(tx, input), new Date(t.created_at), {})
+            this.#track(this.#drive(t.id, (tx) => fn(tx, input), new Date(t.created_at), t.isolation ? { isolation: t.isolation } : {})
               .catch((e) => { if (!(e instanceof FencedError)) this.#opts.onError(e); })
               .finally(() => { running--; this.#wake?.(); }));
           }
@@ -678,17 +759,21 @@ export class PgTxn<T = any> {
     }
   }
 
-  // Forgets functions whose effect is finished or was never committed.
+  // Forgets functions whose effect is finished, or never became visible (its
+  // transaction rolled back) within an hour.
   async #sweepLocal(): Promise<void> {
     const old = [...this.#local]
       .filter(([, l]) => Date.now() - l.since > 30_000 && !(l.txId && this.#driving.has(l.txId)))
       .map(([id]) => id);
     if (!old.length) return;
-    const live = new Set((await this.db.query(null,
-      `SELECT coalesce(compensates, id)::text AS id FROM txn.effects
-        WHERE (id = ANY ($1::uuid[]) OR compensates = ANY ($1::uuid[])) AND kind <> 'call'
-          AND status IN ('pending', 'retry_wait', 'running')`, [old])).rows.map((r: any) => r.id));
-    for (const id of old) if (!live.has(id)) this.#local.delete(id);
+    const rows = (await this.db.query(null,
+      `SELECT coalesce(compensates, id)::text AS id, status IN ('pending', 'retry_wait', 'running') AS live FROM txn.effects
+        WHERE (id = ANY ($1::uuid[]) OR compensates = ANY ($1::uuid[])) AND kind <> 'call'`, [old])).rows;
+    const seen = new Map(rows.map((r: any) => [r.id, r.live]));
+    for (const id of old) {
+      const live = seen.get(id);
+      if (live === false || (live === undefined && Date.now() - this.#local.get(id)!.since > 3_600_000)) this.#local.delete(id);
+    }
   }
 
   async #runLocal(e: { id: string; kind: string; name: string; input: unknown; attempt: number; generation: string;
@@ -704,11 +789,11 @@ export class PgTxn<T = any> {
       this.db.query(null, "SELECT txn.heartbeat_effect($1, $2, $3::bigint, $4)", [e.id, this.owner, e.generation, this.#opts.leaseMs]).catch(() => {});
     }, Math.max(1000, this.#opts.leaseMs / 3));
     try {
-      const outcome = await this.#call((ctx) => local.fn(ctx, e.input), { retry: e.delivery === "at-least-once", timeoutMs: local.timeoutMs },
-        e.id, e.attempt, e.tx_id);
+      const outcome = storable(await this.#call((ctx) => local.fn(ctx, e.input), { retry: e.delivery === "at-least-once", timeoutMs: local.timeoutMs },
+        e.id, e.attempt, e.tx_id, null));
       let status = "succeeded";
       if (outcome.ok) {
-        await this.db.query(null, "SELECT txn.complete_effect($1, $2, $3::bigint, $4::jsonb)", [e.id, this.owner, e.generation, json(outcome.result)]);
+        await this.db.query(null, "SELECT txn.complete_effect($1, $2, $3::bigint, $4::jsonb)", [e.id, this.owner, e.generation, outcome.stored]);
       } else {
         status = (await this.db.query(null, "SELECT txn.fail_effect($1, $2, $3::bigint, $4::jsonb, $5, $6) AS s",
           [e.id, this.owner, e.generation, JSON.stringify(outcome.error), outcome.retryable, outcome.retryAfterMs ?? null])).rows[0].s;
@@ -719,12 +804,27 @@ export class PgTxn<T = any> {
     }
   }
 
-  /** Stops the worker and waits (up to drainMs) for work in progress. */
+  /**
+   * Stops taking work and waits (up to drainMs) for work in progress: this
+   * process's transactions, spawned functions and compensations, and the
+   * background transactions it runs. New calls are refused.
+   */
   async close(drainMs = 30_000): Promise<void> {
+    this.#closing = true;
+    const deadline = Date.now() + drainMs;
+    while (Date.now() < deadline) {
+      this.#wake?.();
+      const pending = this.#local.size
+        ? Number((await this.db.query(null,
+          "SELECT count(*) AS n FROM txn.effects WHERE local_owner = $1 AND kind <> 'call' AND status IN ('pending', 'retry_wait', 'running')",
+          [this.owner]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n)
+        : 0;
+      if (!this.#calls && !this.#driving.size && !this.#busy.size && !pending) break;
+      await sleep(50);
+    }
     this.#closed = true;
     this.#wake?.();
     await this.#worker;
     await this.#unlisten?.();
-    await Promise.race([Promise.allSettled([...this.#busy]), sleep(drainMs)]);
   }
 }

@@ -27,6 +27,10 @@ On shutdown:
 process.on("SIGTERM", () => pgtxn.close().then(() => process.exit(0)))
 ```
 
+`close(drainMs = 30000)` refuses new calls and waits for this process's
+transactions in progress, their spawned functions and compensations, and the
+background transactions it runs.
+
 Other libraries:
 
 ```ts
@@ -121,7 +125,15 @@ With `retry` on:
 
 - `throw new PermanentError(msg)` stops the attempts.
 - `throw new RetryableError(msg, { retryAfterMs })` sets the delay before the
-  next attempt.
+  next attempt. A delay over 15 minutes fails the effect instead: a
+  transaction is not meant to wait that long.
+
+An effect whose result cannot be stored (a `Map`, a string with `U+0000`, …)
+fails for good, as if it had thrown.
+
+`tx` belongs to the transaction's runs: inside an effect's or a spawned
+function (they run outside the transaction) and after the transaction ended,
+using it throws. A spawned function may start a new `pgtxn.transaction`.
 
 When the effect fails for good, `EffectFailedError` is thrown into `fn`.
 You can catch it and still commit.
@@ -159,7 +171,12 @@ await pgtxn.wait(id)                                    // its output
 ```
 
 Pass `{ trx }` to `enqueue` to queue the transaction iff your transaction
-commits.
+commits. `run` and `enqueue` also take `id` (idempotent, as for
+`transaction`), `key`/`keys`, and `isolation`, which is stored: a
+transaction resumed by another process runs at the same level.
+
+Keep each run (the code between effects) well under `leaseMs`: the lease is
+renewed between runs, not during one.
 
 ### `tx.now()` and `tx.uuid()`
 

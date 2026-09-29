@@ -19,3 +19,8 @@ config :pg_txn, PgTxn.ImpatientRepo,
   url: System.get_env("PG_TXN_ECTO_URL", "ecto://app:app@localhost:55461/app"),
   pool_size: 2,
   pg_txn: [listen: false]
+
+config :pg_txn, PgTxn.SweepRepo,
+  url: System.get_env("PG_TXN_ECTO_URL", "ecto://app:app@localhost:55461/app"),
+  pool_size: 3,
+  pg_txn: [listen: false]

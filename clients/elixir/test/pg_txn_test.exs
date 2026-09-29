@@ -912,4 +912,207 @@ defmodule PgTxnTest do
     assert_raise ArgumentError, ~r/has ended/, fn -> PgTxn.spawn(leaked, fn -> 1 end) end
     assert_raise ArgumentError, ~r/has ended/, fn -> PgTxn.now(leaked) end
   end
+
+  # ------------------------------------------------------------------ adversarial fixes
+
+  test "a transaction can be started inside an effect's or a spawned function" do
+    test = self()
+
+    {:ok, outer} =
+      PgTxn.transaction(Repo, fn tx ->
+        inner = PgTxn.effect(tx, fn -> {:ok, inner} = PgTxn.transaction(Repo, fn t2 -> PgTxn.effect(t2, fn -> "inner" end) end); inner end)
+
+        PgTxn.spawn(tx, fn ->
+          {:ok, v} = PgTxn.transaction(Repo, fn t3 -> PgTxn.effect(t3, fn -> "from spawn" end) end)
+          send(test, {:nested, v})
+          :ok
+        end)
+
+        inner <> "+outer"
+      end)
+
+    assert outer == "inner+outer"
+    assert collect(:nested, 1) == ["from spawn"]
+  end
+
+  test "an effect result that cannot be stored fails the effect for good, once" do
+    c = counter()
+
+    for {label, result} <- [tuple: {:a, 1}, nul: "a\0b", pid: self()] do
+      tx_id = Ecto.UUID.generate()
+
+      error =
+        assert_raise PgTxn.EffectFailedError, fn ->
+          PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> bump(c, label); result end, retry: true) end, id: tx_id)
+        end
+
+      assert error.error["message"] =~ "cannot be stored"
+      assert count(c, label) == 1
+      assert tx_status(tx_id) == "failed"
+    end
+  end
+
+  defmodule BadMessageError do
+    defexception []
+    @impl true
+    def message(_), do: raise("no message")
+  end
+
+  test "errors that cannot be encoded are stored as inspected text" do
+    for reason <- [%{"name" => "X", "message" => {:not, :text}}, %BadMessageError{}, "nul\0byte", <<255, 0>>] do
+      error =
+        assert_raise PgTxn.EffectFailedError, fn ->
+          PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> {:error, reason} end) end)
+        end
+
+      assert is_binary(error.error["message"])
+    end
+  end
+
+  test "a failure while performing effects fails the transaction and releases its keys" do
+    key = "perform:#{insert_order()}"
+    tx_id = Ecto.UUID.generate()
+
+    assert_raise Postgrex.Error, fn ->
+      PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> 1 end, name: "bad\0name") end, key: key, id: tx_id)
+    end
+
+    assert tx_status(tx_id) == "failed"
+    t0 = System.monotonic_time(:millisecond)
+    assert {:ok, 1} = PgTxn.transaction(Repo, fn _ -> 1 end, key: key)
+    assert System.monotonic_time(:millisecond) - t0 < 500
+  end
+
+  test "retry_after_ms beyond 15 minutes fails the effect; a negative one is clamped to 0" do
+    c = counter()
+
+    error =
+      assert_raise PgTxn.EffectFailedError, fn ->
+        PgTxn.transaction(Repo, fn tx ->
+          PgTxn.effect(tx, fn -> bump(c, :far); raise PgTxn.RetryableError, retry_after_ms: 16 * 60_000 end, retry: true)
+        end)
+      end
+
+    assert count(c, :far) == 1
+    assert error.error["message"] =~ "beyond"
+
+    assert_raise PgTxn.EffectFailedError, fn ->
+      PgTxn.transaction(Repo, fn tx ->
+        PgTxn.effect(tx, fn -> raise PgTxn.RetryableError, retry_after_ms: :infinity end, retry: true)
+      end)
+    end
+
+    t0 = System.monotonic_time(:millisecond)
+
+    assert {:ok, "ok"} =
+             PgTxn.transaction(Repo, fn tx ->
+               PgTxn.effect(tx, fn -> if bump(c, :neg) == 1, do: raise(PgTxn.RetryableError, retry_after_ms: -500), else: "ok" end, retry: true)
+             end)
+
+    assert System.monotonic_time(:millisecond) - t0 < 1_000
+  end
+
+  test "a spawn inside a Repo.transaction open longer than the sweep threshold still runs; a rolled-back one is forgotten" do
+    start_supervised!(PgTxn.SweepRepo)
+    test = self()
+
+    {:ok, id} =
+      PgTxn.SweepRepo.transaction(fn ->
+        id = PgTxn.spawn(PgTxn.SweepRepo, fn -> send(test, :late_spawn); :ok end)
+        # several maintenance ticks while the spawn is invisible
+        Process.sleep(400)
+        id
+      end)
+
+    assert_receive :late_spawn, 5_000
+    wait_until(fn -> PgTxn.Local.get(PgTxn.SweepRepo, id) == nil end)
+
+    {:error, {:rolled_back, gone}} =
+      PgTxn.SweepRepo.transaction(fn -> PgTxn.SweepRepo.rollback({:rolled_back, PgTxn.spawn(PgTxn.SweepRepo, fn -> :ok end)}) end)
+
+    assert PgTxn.Local.get(PgTxn.SweepRepo, gone) != nil
+    wait_until(fn -> PgTxn.Local.get(PgTxn.SweepRepo, gone) == nil end, 5_000)
+  end
+
+  test "effects of this node it has no function for fail as EffectLost on the maintenance tick" do
+    start_supervised!(PgTxn.SweepRepo)
+    %{rows: [[ghost]]} = PgTxn.SweepRepo.query!("SELECT txn.spawn($1::text::uuid, 'ghost')::text", [PgTxn.Config.owner(PgTxn.SweepRepo)])
+    wait_until(fn -> scalar("SELECT status FROM txn.effects WHERE id = $1::text::uuid", [ghost]) == "failed" end, 3_000)
+    assert scalar("SELECT error->>'name' FROM txn.effects WHERE id = $1::text::uuid", [ghost]) == "EffectLost"
+  end
+
+  test "a resumed transaction that diverged gets its compensation run at once" do
+    test = self()
+    flag = counter()
+
+    PgTxn.define(Repo, "diverge", fn tx, _ ->
+      deps = if count(flag, :resumed) == 0, do: 1, else: 2
+      PgTxn.effect(tx, fn -> "charge #{deps}" end, name: "charge", deps: deps, compensate: fn r -> send(test, {:refund, r}); :ok end)
+
+      if deps == 1 do
+        PgTxn.effect(tx, fn -> send(test, :blocked); Process.sleep(60_000) end, name: "block")
+      end
+
+      deps
+    end)
+
+    tx_id = Ecto.UUID.generate()
+    pid = spawn(fn -> PgTxn.run(Repo, "diverge", %{}, id: tx_id, lease_ms: 1500) end)
+    assert_receive :blocked, 5_000
+    bump(flag, :resumed)
+    Process.exit(pid, :kill)
+
+    assert {:ok, 2} = PgTxn.wait(Repo, tx_id, 15_000)
+    assert_receive {:refund, "charge 1"}, 3_000
+  end
+
+  test "the worker's shutdown lets transactions in progress and their spawns finish, then refuses new calls" do
+    start_supervised!(PgTxn.DrainRepo)
+    test = self()
+
+    task =
+      Task.async(fn ->
+        PgTxn.transaction(PgTxn.DrainRepo, fn tx ->
+          PgTxn.effect(tx, fn -> send(test, :in_effect); Process.sleep(300); 1 end)
+          PgTxn.spawn(tx, fn -> Process.sleep(200); send(test, :spawn_done); :ok end)
+        end)
+      end)
+
+    assert_receive :in_effect, 5_000
+    :ok = stop_supervised(PgTxn.DrainRepo)
+    assert {:ok, _} = Task.await(task)
+    assert_received :spawn_done
+    assert_raise ArgumentError, ~r/no PgTxn.Worker is running/, fn -> PgTxn.transaction(PgTxn.DrainRepo, fn _ -> 1 end) end
+  end
+
+  test "an enqueued transaction runs at its isolation level; so does transaction/3 with :isolation" do
+    level = fn -> Repo.query!("SELECT current_setting('transaction_isolation')").rows |> hd() |> hd() end
+    PgTxn.define(Repo, "iso", fn tx, _ -> PgTxn.effect(tx, fn -> 1 end); level.() end)
+
+    id = PgTxn.enqueue(Repo, "iso", %{}, isolation: :serializable)
+    assert {:ok, "serializable"} = PgTxn.wait(Repo, id, 10_000)
+    assert scalar("SELECT isolation FROM txn.transactions WHERE id = $1::text::uuid", [id]) == "serializable"
+
+    assert {:ok, "repeatable read"} =
+             PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> 1 end); level.() end, isolation: :repeatable_read, lease_ms: 3000)
+  end
+
+  test "concurrent calls with the same id get the one outcome; the function runs once" do
+    c = counter()
+    id = Ecto.UUID.generate()
+
+    f = fn tx ->
+      bump(c, :fun)
+      PgTxn.effect(tx, fn -> bump(c, :effect); Process.sleep(200); "paid" end)
+    end
+
+    results = for(_ <- 1..5, do: Task.async(fn -> PgTxn.transaction(Repo, f, id: id) end)) |> Task.await_many(15_000)
+    assert Enum.uniq(results) == [{:ok, "paid"}]
+    assert count(c, :effect) == 1
+
+    # an id without effects is idempotent too
+    id2 = Ecto.UUID.generate()
+    assert {:ok, "first"} = PgTxn.transaction(Repo, fn _ -> "first" end, id: id2)
+    assert {:ok, "first"} = PgTxn.transaction(Repo, fn _ -> "second" end, id: id2)
+  end
 end

@@ -23,19 +23,20 @@ after(async () => {
 const status = async (id: string) => (await pool.query("SELECT status, runs FROM txn.transactions WHERE id = $1", [id])).rows[0];
 
 describe("transactions", () => {
-  test("without effects: one run, an ordinary transaction, nothing recorded", async () => {
+  test("without effects (and no id or key): one run, an ordinary transaction, nothing recorded", async () => {
     const id = await newOrder(pool);
     let runs = 0;
-    const txId = crypto.randomUUID();
+    const count = async () => (await pool.query("SELECT count(*)::int AS n FROM txn.transactions")).rows[0].n;
+    const before = await count();
     const out = await pgtxn.transaction(async (tx) => {
       runs++;
       await tx.db.query("UPDATE orders SET status = 'seen' WHERE id = $1", [id]);
       return "done";
-    }, { id: txId });
+    });
     assert.equal(out, "done");
     assert.equal(runs, 1);
     assert.equal((await pool.query("SELECT status FROM orders WHERE id = $1", [id])).rows[0].status, "seen");
-    assert.equal(await status(txId), undefined, "no durable record for a transaction without effects");
+    assert.equal(await count(), before, "no durable record for a transaction without effects");
   });
 
   test("N sequential effects: N+1 runs, each effect called once, results reused", async () => {
@@ -210,7 +211,7 @@ describe("transactions", () => {
     assert.equal(calls, 1);
   });
 
-  test("an error in user code before any effect: rolled back, nothing recorded", async () => {
+  test("an error in user code before any effect: rolled back; with an id, the failure is recorded", async () => {
     const orderId = await newOrder(pool);
     const txId = crypto.randomUUID();
     await assert.rejects(pgtxn.transaction(async (tx) => {
@@ -218,7 +219,7 @@ describe("transactions", () => {
       throw new Error("validation failed");
     }, { id: txId }), /validation failed/);
     assert.equal((await pool.query("SELECT status FROM orders WHERE id = $1", [orderId])).rows[0].status, "new");
-    assert.equal(await status(txId), undefined);
+    assert.equal((await status(txId)).status, "failed");
   });
 
   test("serializable transactions retry serialization failures by themselves", async () => {

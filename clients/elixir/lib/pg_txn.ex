@@ -69,39 +69,27 @@ defmodule PgTxn do
   `["order",42]`, the same as in the other clients), `:keys` (a list of
   such keys), `:id` (the transaction
   id, default a new uuid), `:lease_ms`, and any `Repo.transaction/2` option
-  (e.g. `:timeout`). Cannot be called inside another Repo transaction.
+  (e.g. `:timeout`), `:isolation` (`:read_committed`, `:repeatable_read` or
+  `:serializable`: every run's level). Cannot be called inside another Repo
+  transaction; it can be called inside an effect's or a spawned function
+  (a transaction of its own).
 
-  With an `:id`, it is idempotent: if a transaction with that id exists, it
-  is not run again (`fun` is not called); this waits for it to end (up to
-  `:key_wait_ms`) and returns its outcome like `wait/3`: `{:ok, output}`
-  when it committed, `{:error, %PgTxn.TransactionFailedError{}}` when it
-  failed or was abandoned.
+  With an `:id`, it is idempotent: if a transaction with that id exists (it
+  ran, or runs now, here or on another node), it is not run again (`fun` is
+  not called); this waits for it to end (up to `:key_wait_ms`) and returns
+  its outcome like `wait/3`: `{:ok, output}` when it committed,
+  `{:error, %PgTxn.TransactionFailedError{}}` when it failed or was
+  abandoned.
   """
   @spec transaction(repo, (tx -> result), keyword) ::
           {:ok, result} | {:error, term} | {:error, TransactionFailedError.t() | :timeout}
         when result: term
   def transaction(repo, fun, opts \\ []) when is_function(fun, 1) do
-    case opts[:id] && ended(repo, opts[:id]) do
-      outcome when is_tuple(outcome) ->
-        outcome
-
-      _new ->
-        opts = if Loop.keys(opts), do: Keyword.put(opts, :start, {nil, nil}), else: opts
-        Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, opts)
-    end
-  end
-
-  # the outcome of a transaction that exists (waiting for it if another
-  # process runs it), or nil; each drive has an owner of its own, so a
-  # recorded transaction is never this call's
-  defp ended(repo, id) do
-    unless repo.in_transaction?() do
-      Schema.ensure!(repo)
-
-      if SQL.one(repo, "SELECT status FROM txn.transactions WHERE id = $1::text::uuid", [id]) do
-        wait(repo, id, Config.get(repo, :key_wait_ms))
-      end
-    end
+    Local.active(repo, fn ->
+      # without an id or keys there is nothing to arbitrate: no durable record until an effect
+      opts = if opts[:id] || Loop.keys(opts), do: Keyword.put(opts, :start, {nil, nil}), else: opts
+      Loop.drive(repo, opts[:id] || Ecto.UUID.generate(), fun, opts)
+    end)
   end
 
   @doc """
@@ -189,10 +177,22 @@ defmodule PgTxn do
     Call.validate!(opts)
     with %Tx{} = tx <- tx_or_repo, do: Tx.check!(tx)
     repo = repo!(tx_or_repo)
-    unless match?(%Tx{}, tx_or_repo), do: Schema.ensure!(repo)
+
+    unless match?(%Tx{}, tx_or_repo) do
+      Local.open!(repo)
+      Schema.ensure!(repo)
+    end
+
     id = Ecto.UUID.generate()
     owner = Config.owner(repo)
-    call = fn ctx, _input -> if is_function(fun, 0), do: fun.(), else: fun.(ctx) end
+    # the spawning run's tx must not be used in it
+    run = with %Tx{ref: ref} <- tx_or_repo, do: ref, else: (_ -> nil)
+
+    call = fn ctx, _input ->
+      if run, do: Process.put(Call.in_effect_key(), run)
+      if is_function(fun, 0), do: fun.(), else: fun.(ctx)
+    end
+
     tx_id = with %Tx{id: tx_id} <- tx_or_repo, do: tx_id, else: (_ -> nil)
     Local.put(repo, id, :spawn, owner, tx_id, call, opts[:timeout_ms])
 
@@ -233,17 +233,22 @@ defmodule PgTxn do
   background on any node that defines it, iff the surrounding transaction
   commits (like `spawn/3`: pass a `tx` or a Repo). Returns its id, for
   `wait/3`. Options: `:id`, `:key` and `:keys` (as in `transaction/3`: it
-  starts only when no other transaction holds any of them).
+  starts only when no other transaction holds any of them), `:isolation`
+  (its runs' isolation level, wherever it runs).
   """
   @spec enqueue(tx | repo, String.t() | atom, term, keyword) :: String.t()
   def enqueue(tx_or_repo, name, input \\ %{}, opts \\ []) do
     with %Tx{} = tx <- tx_or_repo, do: Tx.check!(tx)
     repo = repo!(tx_or_repo)
-    unless match?(%Tx{}, tx_or_repo), do: Schema.ensure!(repo)
+
+    unless match?(%Tx{}, tx_or_repo) do
+      Local.open!(repo)
+      Schema.ensure!(repo)
+    end
 
     id =
-      SQL.value(repo, "SELECT txn.enqueue($1, $2::text::jsonb, $3::text::uuid, $4::text[])::text",
-        [to_string(name), DJSON.encode!(input), opts[:id], Loop.keys(opts)])
+      SQL.value(repo, "SELECT txn.enqueue($1, $2::text::jsonb, $3::text::uuid, $4::text[], $5)::text",
+        [to_string(name), DJSON.encode!(input), opts[:id], Loop.keys(opts), Loop.isolation!(opts[:isolation])])
 
     case tx_or_repo do
       %Tx{} = tx -> Tx.mark_spawned(tx)
@@ -271,8 +276,9 @@ defmodule PgTxn do
   @doc """
   Runs the named transaction `name` now, in this process (resumable by any
   node that defines it if this one stops). Returns like `transaction/3`; its
-  output must be a durable value. Options: `:id`, `:key` and `:keys` (as in
-  `transaction/3`), `:lease_ms`.
+  output must be a durable value. Options: `:id` (idempotent, as in
+  `transaction/3`), `:key`, `:keys`, `:isolation` (as in `transaction/3`),
+  `:lease_ms`.
   """
   @spec run(repo, String.t() | atom, term, keyword) :: {:ok, term} | {:error, term}
   def run(repo, name, input, opts \\ []) do
@@ -282,7 +288,9 @@ defmodule PgTxn do
     encoded = DJSON.encode!(input)
     stored = DJSON.decode!(encoded)
     # txn.start records its created_at: now/1 of the first run and of resumed ones agree
-    Loop.drive(repo, id, fn tx -> fun.(tx, stored) end, Keyword.merge(opts, named: true, start: {name, encoded}))
+    Local.active(repo, fn ->
+      Loop.drive(repo, id, fn tx -> fun.(tx, stored) end, Keyword.merge(opts, named: true, start: {name, encoded}))
+    end)
   end
 
   @doc """
