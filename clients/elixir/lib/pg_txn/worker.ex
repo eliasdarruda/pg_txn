@@ -392,7 +392,7 @@ defmodule PgTxn.Worker do
 
           if status not in ["retry_wait", "stale"], do: Local.delete(repo, [key])
         after
-          Task.shutdown(heartbeat, :brutal_kill)
+          PgTxn.Proc.shutdown(heartbeat)
         end
     end
   end

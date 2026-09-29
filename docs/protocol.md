@@ -25,7 +25,8 @@ Inputs, results and outputs are `jsonb`. SDKs may encode richer values
 `{"$bigint": "..."}`, etc.). Effect deps are hashed **in SQL** from their
 `jsonb` form (`txn._hash(name, deps)`), so memoization never depends on a
 client's JSON printer. Transaction keys are text: a string as is, anything
-else as its JSON text.
+else as its canonical JSON (the stored-value encoding, object keys sorted),
+so every client produces the same text for the same key.
 
 ## A transaction
 

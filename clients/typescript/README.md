@@ -89,7 +89,7 @@ Runs `fn(tx)` as one transaction that may include effects, and returns what
 
 | option | |
 |---|---|
-| `key` | transactions with the same key run one at a time; the others wait, holding nothing. A string, or JSON such as `["order", id]`. |
+| `key` | transactions with the same key run one at a time; the others wait, holding nothing. A string, or JSON such as `["order", id]` (compared as canonical JSON: object key order does not matter). |
 | `keys` | several keys, claimed all at once or none (no deadlocks), e.g. `[["account", from], ["account", to]]` |
 | `id` | the transaction id. Idempotent: an id that already ended returns its recorded output (or throws its error) without running `fn` again, so a retried request is safe. |
 | `isolation` | e.g. `"serializable"` |
@@ -175,8 +175,10 @@ commits. `run` and `enqueue` also take `id` (idempotent, as for
 `transaction`), `key`/`keys`, and `isolation`, which is stored: a
 transaction resumed by another process runs at the same level.
 
-Keep each run (the code between effects) well under `leaseMs`: the lease is
-renewed between runs, not during one.
+The lease is renewed every `leaseMs / 3` while this process drives the
+transaction, runs included. A process that stops renewing it (it died, or its
+event loop is blocked for longer than `leaseMs`) loses the transaction to
+another process.
 
 ### `tx.now()` and `tx.uuid()`
 

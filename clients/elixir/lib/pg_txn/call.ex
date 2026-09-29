@@ -27,17 +27,23 @@ defmodule PgTxn.Call do
   def call(thunk, opts) do
     timeout = Keyword.get(opts, :timeout_ms, 30_000)
     retry = Keyword.get(opts, :retry, false)
-    task =
-      Task.async(fn ->
+    proc =
+      PgTxn.Proc.async(fn ->
         Process.put(in_effect_key(), Keyword.get(opts, :run))
         invoke(thunk)
       end)
 
     reply =
-      case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-        {:ok, reply} -> reply
-        {:exit, reason} -> {:error, %{"name" => "Exit", "message" => inspect(reason)}}
-        nil -> {:error, %{"name" => "EffectTimeout", "message" => "effect timed out after #{timeout} ms"}}
+      case PgTxn.Proc.yield(proc, timeout) do
+        {:ok, reply} ->
+          reply
+
+        {:exit, reason} ->
+          {:error, %{"name" => "Exit", "message" => inspect(reason)}}
+
+        nil ->
+          PgTxn.Proc.shutdown(proc)
+          {:error, %{"name" => "EffectTimeout", "message" => "effect timed out after #{timeout} ms"}}
       end
 
     classify(reply, retry)

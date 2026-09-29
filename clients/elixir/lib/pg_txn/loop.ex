@@ -68,26 +68,20 @@ defmodule PgTxn.Loop do
       tx_id: tx_id,
       owner: owner,
       lease_ms: lease_ms,
-      named: Keyword.get(opts, :named, false),
+      durable: Keyword.get(opts, :named, false) or Keyword.has_key?(opts, :id),
       repo_opts: Keyword.drop(opts, @own_opts),
       # every run is rolled back but the last, so the count is kept here
       runs: 0,
       isolation: isolation,
       run: nil,
-      # 1 while a run's database transaction is open
-      in_run: :atomics.new(1, []),
       started_at: DateTime.truncate(started_at, :millisecond)
     }
 
-    # the lease is kept for the whole time this process drives the
-    # transaction, but not while a run is open: under repeatable read or
-    # serializable, the run's own update of the row would then fail to
-    # serialize
+    # the lease (txn.leases, apart from the row a run updates) is kept for
+    # the whole time this process drives the transaction, runs included
     heartbeat =
       every(max(1000, div(ctx.lease_ms, 3)), fn ->
-        if :atomics.get(ctx.in_run, 1) == 0 do
-          SQL.all(repo, "SELECT txn.heartbeat($1::text::uuid, $2::text::uuid, $3)", [tx_id, ctx.owner, ctx.lease_ms])
-        end
+        SQL.all(repo, "SELECT txn.heartbeat($1::text::uuid, $2::text::uuid, $3)", [tx_id, ctx.owner, ctx.lease_ms])
       end)
 
     Local.driving(repo, tx_id)
@@ -95,7 +89,7 @@ defmodule PgTxn.Loop do
     try do
       loop(ctx, fun, 0)
     after
-      Task.shutdown(heartbeat, :brutal_kill)
+      PgTxn.Proc.shutdown(heartbeat)
       Local.driven(repo, tx_id)
       keep_compensations(ctx)
     end
@@ -130,8 +124,10 @@ defmodule PgTxn.Loop do
 
   @doc """
   The keys of options `:key` (one) and `:keys` (a list) as stored, or nil
-  for none: a string as is, any other term as its JSON text (tuples as
-  arrays), like the other clients.
+  for none: a string as is, any other term as its canonical DJSON text
+  (sorted object keys, tuples as arrays), like the other clients:
+  `["order", 42]` is `["order",42]`, `%{b: 1, a: 2}` is `{"a":2,"b":1}`.
+  nil, and terms that are not durable values, raise an ArgumentError.
   """
   @spec keys(keyword) :: [String.t()] | nil
   def keys(opts) do
@@ -144,13 +140,19 @@ defmodule PgTxn.Loop do
   end
 
   defp key_text(key) when is_binary(key), do: key
-  defp key_text(key), do: key |> json_key() |> Jason.encode!()
+  defp key_text(nil), do: raise(ArgumentError, "pg_txn: a key cannot be nil")
 
-  defp json_key(t) when is_tuple(t), do: t |> Tuple.to_list() |> json_key()
-  defp json_key(l) when is_list(l), do: Enum.map(l, &json_key/1)
-  defp json_key(%{__struct__: _} = s), do: s
-  defp json_key(m) when is_map(m), do: Map.new(m, fn {k, v} -> {k, json_key(v)} end)
-  defp json_key(v), do: v
+  defp key_text(key) do
+    key |> lists() |> DJSON.encode!()
+  rescue
+    e in ArgumentError -> reraise ArgumentError, "pg_txn: #{inspect(key)} is not a valid key: #{Exception.message(e)}", __STACKTRACE__
+  end
+
+  defp lists(t) when is_tuple(t), do: t |> Tuple.to_list() |> lists()
+  defp lists(l) when is_list(l), do: Enum.map(l, &lists/1)
+  defp lists(%{__struct__: _} = s), do: s
+  defp lists(m) when is_map(m), do: Map.new(m, fn {k, v} -> {k, lists(v)} end)
+  defp lists(v), do: v
 
   # records the transaction as running (named, with keys, or with an id) and
   # returns when it started; with a key another transaction holds, waits for
@@ -173,6 +175,8 @@ defmodule PgTxn.Loop do
 
       %{"holder" => holder} ->
         wait_for(repo, holder, fn ->
+          # the worker is shutting down (or stopped): do not start later
+          Local.open!(repo)
           waited = System.monotonic_time(:millisecond) - since
           if waited > wait_ms, do: raise(KeyTimeoutError, key: Enum.join(keys, ", "), holder: holder, waited_ms: waited)
         end)
@@ -187,12 +191,9 @@ defmodule PgTxn.Loop do
 
     outcome =
       try do
-        :atomics.put(ctx.in_run, 1, 1)
         ctx.repo.transaction(fn -> run(ctx, tx, fun) end, ctx.repo_opts)
       catch
         kind, reason -> {:caught, kind, reason, __STACKTRACE__}
-      after
-        :atomics.put(ctx.in_run, 1, 0)
       end
 
     state = Tx.close(tx)
@@ -215,14 +216,22 @@ defmodule PgTxn.Loop do
     if state.needs != [], do: ctx.repo.rollback(NeedEffect)
 
     SQL.all(ctx.repo, "SELECT txn.finish($1::text::uuid, $2::text::uuid, $3::text[]::uuid[], $4::text::jsonb, $5)",
-      [ctx.tx_id, ctx.owner, state.consumed, output(result, ctx.named), ctx.runs])
+      [ctx.tx_id, ctx.owner, state.consumed, output(result, ctx.durable), ctx.runs])
 
     result
   end
 
-  # named transactions store their output for PgTxn.wait/3 (it must be a
-  # durable value); inline ones store it when it is one
-  defp output(result, true), do: DJSON.encode!(result)
+  # the output of a transaction that can be asked for again (named, or with
+  # an id: PgTxn.wait/3, an idempotent re-call) must be a durable value, or
+  # the transaction fails; one nobody can ask for again stores it when it is
+  defp output(result, true) do
+    DJSON.encode!(result)
+  rescue
+    e in ArgumentError ->
+      reraise ArgumentError,
+              "pg_txn: the transaction's output cannot be stored (named, or with an :id, it is returned again to a later call): #{Exception.message(e)}",
+              __STACKTRACE__
+  end
 
   defp output(result, false) do
     DJSON.encode!(result)
@@ -304,18 +313,19 @@ defmodule PgTxn.Loop do
   defp execute_all(ctx, needs, actions) do
     actions
     |> Enum.map(fn a ->
-      Task.async(fn ->
+      PgTxn.Proc.async(fn ->
         try do
           execute(ctx, need(needs, a), a)
-        rescue
-          e -> {:raise, e, __STACKTRACE__}
+        catch
+          kind, reason -> {:raise, kind, reason, __STACKTRACE__}
         end
       end)
     end)
-    |> Task.await_many(:infinity)
+    |> Enum.map(&PgTxn.Proc.await/1)
     |> Enum.each(fn
-      {:raise, e, stack} -> reraise e, stack
-      _ -> :ok
+      {:ok, {:raise, kind, reason, stack}} -> :erlang.raise(kind, reason, stack)
+      {:ok, _} -> :ok
+      {:exit, reason} -> exit(reason)
     end)
   end
 
@@ -380,9 +390,10 @@ defmodule PgTxn.Loop do
   end
 
   @doc false
-  # runs fun every `ms` in a process linked to the caller (it dies with it)
+  # runs fun every `ms` in a process that dies with the caller; stop it
+  # with PgTxn.Proc.shutdown/1
   def every(ms, fun) do
-    Task.async(fn -> tick(ms, fun) end)
+    PgTxn.Proc.async(fn -> tick(ms, fun) end)
   end
 
   defp tick(ms, fun) do
@@ -390,8 +401,8 @@ defmodule PgTxn.Loop do
 
     try do
       fun.()
-    rescue
-      _ -> :ok
+    catch
+      _, _ -> :ok
     end
 
     tick(ms, fun)

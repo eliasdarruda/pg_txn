@@ -9,6 +9,21 @@ export type TransactionOptions = {
   isolation?: "read committed" | "repeatable read" | "serializable";
 };
 
+const BEGIN: Record<string, string> = {
+  "read committed": "BEGIN ISOLATION LEVEL READ COMMITTED",
+  "repeatable read": "BEGIN ISOLATION LEVEL REPEATABLE READ",
+  serializable: "BEGIN ISOLATION LEVEL SERIALIZABLE",
+};
+
+/** The isolation level, checked: a stored or user-given value never reaches SQL text unchecked. */
+export function isolationLevel(v: unknown): TransactionOptions["isolation"] {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "string" || !(v in BEGIN)) {
+    throw new TypeError(`pg_txn: isolation must be "read committed", "repeatable read" or "serializable", got ${JSON.stringify(v)}`);
+  }
+  return v as TransactionOptions["isolation"];
+}
+
 export interface Db<T = unknown> {
   /** Runs fn in one database transaction: commit if it resolves, roll back if it throws. */
   transaction<R>(fn: (trx: T) => Promise<R>, options?: TransactionOptions): Promise<R>;
@@ -40,7 +55,8 @@ export function pgDb(pool: PgPool): Db<PgClient> {
     async transaction(fn, options) {
       const client = await pool.connect();
       try {
-        await client.query(options?.isolation ? `BEGIN ISOLATION LEVEL ${options.isolation.toUpperCase()}` : "BEGIN");
+        const level = isolationLevel(options?.isolation);
+        await client.query(level ? BEGIN[level] : "BEGIN");
         const out = await fn(client);
         await client.query("COMMIT");
         return out;

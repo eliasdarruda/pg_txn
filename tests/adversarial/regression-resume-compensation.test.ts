@@ -42,7 +42,7 @@ describe("compensation after a divergent resume", () => {
     await waitFor(async () => (await pool.query("SELECT 1 FROM txn.effects WHERE tx_id = $1 AND name = 'ship' AND status = 'running'", [id])).rows[0], "A stuck in ship");
     // meanwhile the order is cancelled and A stops driving (its lease lapses)
     await pool.query("UPDATE orders SET status = 'cancelled' WHERE id = $1", [orderId]);
-    await pool.query("UPDATE txn.transactions SET lease_until = now() - interval '1 second' WHERE id = $1", [id]);
+    await pool.query("UPDATE txn.leases SET lease_until = now() - interval '1 second' WHERE tx_id = $1", [id]);
     b.define("checkout", def("B"));
     assert.equal(await b.wait(id, 15_000), "cancelled");
     const comp = await waitFor(async () => (await pool.query(

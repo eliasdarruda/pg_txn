@@ -8,7 +8,7 @@ defmodule PgTxn.Local do
   #
   #   {id, kind, owner, tx_id, since_ms, fun, timeout_ms}   kind: :spawn | :compensation
   #   {{:driving, tx_id}, pid}
-  #   {:calls, n}              public calls in progress (transaction/3, run/4)
+  #   {{:call, ref}, pid}      a public call in progress (transaction/3, run/4)
   #   {:closing, true}         the worker is shutting down: new calls are refused
 
   @doc false
@@ -16,9 +16,7 @@ defmodule PgTxn.Local do
 
   @doc false
   def new(repo) do
-    t = :ets.new(table(repo), [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
-    :ets.insert(t, {:calls, 0})
-    t
+    :ets.new(table(repo), [:set, :public, :named_table, read_concurrency: true, write_concurrency: true])
   end
 
   @doc "Raises unless the Repo's worker runs and is not shutting down."
@@ -41,13 +39,16 @@ defmodule PgTxn.Local do
   @doc "Runs a public call (the worker's shutdown waits for it)."
   def active(repo, fun) do
     open!(repo)
-    :ets.update_counter(table(repo), :calls, 1)
+    # one row per call (not a counter): a worker restart recreates the table,
+    # and a call that ends then has nothing to undo
+    key = {:call, make_ref()}
+    :ets.insert(table(repo), {key, self()})
 
     try do
       fun.()
     after
       try do
-        :ets.update_counter(table(repo), :calls, -1)
+        :ets.delete(table(repo), key)
       rescue
         ArgumentError -> :ok
       end
@@ -59,7 +60,7 @@ defmodule PgTxn.Local do
   @doc "Public calls in progress plus transactions driven now."
   def busy(repo) do
     t = table(repo)
-    [{:calls, calls}] = :ets.lookup(t, :calls)
+    calls = t |> :ets.match({{:call, :_}, :"$1"}) |> List.flatten() |> Enum.count(&Process.alive?/1)
     drives = t |> :ets.match({{:driving, :_}, :"$1"}) |> List.flatten() |> Enum.count(&Process.alive?/1)
     calls + drives
   end

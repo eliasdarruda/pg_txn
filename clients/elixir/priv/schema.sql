@@ -46,13 +46,13 @@ CREATE TABLE txn.transactions (
     id          uuid PRIMARY KEY,
     name        text,                   -- NULL: inline (not resumable by another process)
     keys        text[],                 -- the keys it runs under (see txn.keys)
-    isolation   text,                   -- its runs' isolation level (NULL: the database default)
+    isolation   text                    -- its runs' isolation level (NULL: the database default)
+                CHECK (isolation IN ('read committed', 'repeatable read', 'serializable')),
     input       jsonb,                  -- named transactions: their input
     status      text NOT NULL DEFAULT 'running'
                 CHECK (status IN ('running', 'committed', 'failed', 'abandoned')),
     owner       uuid,                   -- the process driving it (NULL: waiting for a worker)
     generation  bigint NOT NULL DEFAULT 0,
-    lease_until timestamptz,
     runs        integer NOT NULL DEFAULT 0,
     output      jsonb,
     error       jsonb,
@@ -60,7 +60,16 @@ CREATE TABLE txn.transactions (
     updated_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
     finished_at timestamptz
 );
-CREATE INDEX transactions_running ON txn.transactions (lease_until) WHERE status = 'running';
+CREATE INDEX transactions_running ON txn.transactions (created_at) WHERE status = 'running';
+
+-- the lease of the process driving a transaction, renewed by its heartbeat;
+-- apart from txn.transactions so that heartbeats never touch the row a run
+-- updates (under repeatable read or serializable, that run would fail)
+CREATE TABLE txn.leases (
+    tx_id       uuid PRIMARY KEY REFERENCES txn.transactions ON DELETE CASCADE,
+    lease_until timestamptz NOT NULL
+);
+CREATE INDEX leases_until ON txn.leases (lease_until);
 -- keys held by running transactions
 CREATE TABLE txn.keys (
     key   text PRIMARY KEY,
@@ -100,6 +109,10 @@ CREATE UNIQUE INDEX effects_call ON txn.effects (tx_id, seq, input_hash) WHERE k
 CREATE INDEX effects_due ON txn.effects (local_owner, next_attempt_at) WHERE kind <> 'call' AND status IN ('pending', 'retry_wait');
 CREATE INDEX effects_leased ON txn.effects (lease_until) WHERE kind <> 'call' AND status = 'running';
 CREATE INDEX effects_tx ON txn.effects (tx_id);
+-- a process's unfinished spawns and compensations (fail_lost_effects, close, sweeps)
+CREATE INDEX effects_open ON txn.effects (local_owner, created_at)
+    WHERE kind <> 'call' AND status IN ('pending', 'retry_wait', 'running');
+CREATE INDEX effects_compensates ON txn.effects (compensates) WHERE compensates IS NOT NULL;
 
 CREATE TABLE txn.effect_attempts (
     id          bigserial PRIMARY KEY,
@@ -143,6 +156,21 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- inside an attempt (the application's own transaction)
+
+-- Sets the lease of p_tx to p_lease_ms from now.
+CREATE FUNCTION txn._lease(p_tx uuid, p_lease_ms integer) RETURNS void
+LANGUAGE sql AS $$
+    INSERT INTO txn.leases (tx_id, lease_until)
+    VALUES (p_tx, txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    ON CONFLICT (tx_id) DO UPDATE SET lease_until = EXCLUDED.lease_until
+$$;
+
+-- Whether nobody holds the lease of p_tx (none yet, or it expired p_grace_ms ago).
+CREATE FUNCTION txn._lease_expired(p_tx uuid, p_grace_ms integer DEFAULT 0) RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT coalesce((SELECT l.lease_until < txn._now() - pg_catalog.make_interval(secs => p_grace_ms / 1000.0)
+                       FROM txn.leases l WHERE l.tx_id = p_tx), true)
+$$;
 
 -- Marks this database transaction as a run of logical transaction p_tx.
 -- Fails if another process drives it now.
@@ -208,8 +236,9 @@ BEGIN
     IF p_name IS NULL THEN
         RAISE EXCEPTION 'pg_txn: enqueue needs the name of a defined transaction' USING ERRCODE = 'null_value_not_allowed';
     END IF;
-    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, lease_until)
-    VALUES (id, p_name, coalesce(p_input, '{}'), p_keys, p_isolation, NULL, txn._now())
+    PERFORM txn._check_keys(p_keys);
+    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner)
+    VALUES (id, p_name, coalesce(p_input, '{}'), p_keys, p_isolation, NULL)
     ON CONFLICT ON CONSTRAINT transactions_pkey DO NOTHING;
     PERFORM pg_catalog.pg_notify('txn_effects', p_name);
     RETURN id;
@@ -239,7 +268,7 @@ BEGIN
     n := txn._orphan(p_tx, p_consumed, NULL);
     DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
-       SET status = 'committed', output = p_output, owner = NULL, lease_until = NULL, runs = runs + p_runs,
+       SET status = 'committed', output = p_output, owner = NULL, runs = runs + p_runs,
            updated_at = txn._now(), finished_at = txn._now()
      WHERE id = p_tx;
     PERFORM pg_catalog.pg_notify('txn_done', p_tx::text);
@@ -296,17 +325,18 @@ DECLARE
     action text;
     wait_ms integer;
 BEGIN
-    INSERT INTO txn.transactions AS x (id, owner, generation, lease_until)
-    VALUES (p_tx, p_owner, 1, txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    INSERT INTO txn.transactions AS x (id, owner, generation)
+    VALUES (p_tx, p_owner, 1)
     ON CONFLICT (id) DO UPDATE
        SET owner = p_owner,
            generation = x.generation + CASE WHEN x.owner IS DISTINCT FROM p_owner THEN 1 ELSE 0 END,
-           lease_until = EXCLUDED.lease_until, updated_at = txn._now()
-     WHERE x.status = 'running' AND (x.owner = p_owner OR x.owner IS NULL OR x.lease_until < txn._now())
+           updated_at = txn._now()
+     WHERE x.status = 'running' AND (x.owner = p_owner OR x.owner IS NULL OR txn._lease_expired(x.id))
     RETURNING * INTO t;
     IF NOT FOUND THEN
         RETURN pg_catalog.jsonb_build_object('conflict', pg_catalog.jsonb_build_object('reason', 'fenced'));
     END IF;
+    PERFORM txn._lease(p_tx, p_lease_ms);
 
     FOR e IN SELECT * FROM pg_catalog.jsonb_array_elements(coalesce(p_effects, '[]')) LOOP
         INSERT INTO txn.effects (tx_id, kind, seq, name, input, input_hash, max_attempts, delivery, compensation)
@@ -402,11 +432,13 @@ BEGIN
 END $$;
 
 -- Extends the lease of a transaction the process is driving (during long calls).
+-- Never touches txn.transactions, so it can run while a run is open.
 CREATE FUNCTION txn.heartbeat(p_tx uuid, p_owner uuid, p_lease_ms integer) RETURNS boolean
 LANGUAGE sql AS $$
-    UPDATE txn.transactions
-       SET lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0), updated_at = txn._now()
-     WHERE id = p_tx AND owner = p_owner AND status = 'running'
+    UPDATE txn.leases l
+       SET lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0)
+      FROM txn.transactions t
+     WHERE l.tx_id = p_tx AND t.id = p_tx AND t.owner = p_owner AND t.status = 'running'
     RETURNING true
 $$;
 
@@ -422,11 +454,19 @@ BEGIN
     PERFORM txn._orphan(p_tx, '{}', NULL);
     DELETE FROM txn.keys WHERE tx_id = p_tx;
     UPDATE txn.transactions
-       SET status = 'failed', error = p_error, owner = NULL, lease_until = NULL, runs = runs + p_runs,
+       SET status = 'failed', error = p_error, owner = NULL, runs = runs + p_runs,
            updated_at = txn._now(), finished_at = txn._now()
      WHERE id = p_tx;
     PERFORM pg_catalog.pg_notify('txn_done', p_tx::text);
     RETURN true;
+END $$;
+
+CREATE FUNCTION txn._check_keys(p_keys text[]) RETURNS void
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF p_keys IS NOT NULL AND pg_catalog.array_position(p_keys, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'pg_txn: a transaction key is NULL' USING ERRCODE = 'null_value_not_allowed';
+    END IF;
 END $$;
 
 -- Claims all of p_keys for p_tx, or none: returns NULL when they are held
@@ -486,15 +526,16 @@ DECLARE
     t txn.transactions;
     h uuid;
 BEGIN
-    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, generation, lease_until)
-    VALUES (p_tx, p_name, p_input, p_keys, p_isolation, p_owner, 1,
-            txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0))
+    PERFORM txn._check_keys(p_keys);
+    INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, generation)
+    VALUES (p_tx, p_name, p_input, p_keys, p_isolation, p_owner, 1)
     ON CONFLICT (id) DO NOTHING
     RETURNING * INTO t;
     IF NOT FOUND THEN
         RETURN QUERY SELECT NULL::timestamptz, NULL::uuid, true;
         RETURN;
     END IF;
+    PERFORM txn._lease(p_tx, p_lease_ms);
     IF p_keys IS NOT NULL THEN
         h := txn._claim(p_tx, p_keys);
         IF h IS NOT NULL THEN
@@ -681,23 +722,34 @@ BEGIN
     FOR c IN
         SELECT t.id, t.keys FROM txn.transactions t
          WHERE t.status = 'running' AND t.name = ANY (p_names)
-           AND (t.owner IS NULL OR t.lease_until < txn._now())
+           AND (t.owner IS NULL OR txn._lease_expired(t.id))
            -- a live process keeps driving its own transactions
            AND t.owner IS DISTINCT FROM p_owner
+           -- queued under a key another transaction holds: not a candidate,
+           -- so blocked ones never crowd out runnable ones
+           AND NOT EXISTS (SELECT 1 FROM txn.keys k WHERE k.key = ANY (t.keys) AND k.tx_id <> t.id)
          ORDER BY t.created_at
          LIMIT p_max * 4
          FOR UPDATE SKIP LOCKED
     LOOP
         EXIT WHEN n >= p_max;
-        -- queued under keys another transaction holds: its turn comes later
-        CONTINUE WHEN c.keys IS NOT NULL AND txn._claim(c.id, c.keys, false) IS NOT NULL;
-        RETURN QUERY
-        UPDATE txn.transactions t
-           SET owner = p_owner, generation = t.generation + 1, updated_at = txn._now(),
-               lease_until = txn._now() + pg_catalog.make_interval(secs => p_lease_ms / 1000.0)
-         WHERE t.id = c.id
-        RETURNING t.id, t.name, t.input, t.runs, t.created_at, t.isolation;
-        n := n + 1;
+        BEGIN
+            -- a key claimed by another transaction right now: its turn comes later
+            CONTINUE WHEN c.keys IS NOT NULL AND txn._claim(c.id, c.keys, false) IS NOT NULL;
+            PERFORM txn._lease(c.id, p_lease_ms);
+            RETURN QUERY
+            UPDATE txn.transactions t
+               SET owner = p_owner, generation = t.generation + 1, updated_at = txn._now()
+             WHERE t.id = c.id
+            RETURNING t.id, t.name, t.input, t.runs, t.created_at, t.isolation;
+            n := n + 1;
+        EXCEPTION WHEN OTHERS THEN
+            -- a transaction that cannot be started fails; it never blocks the others
+            UPDATE txn.transactions t
+               SET status = 'failed', owner = NULL, updated_at = txn._now(), finished_at = txn._now(),
+                   error = pg_catalog.jsonb_build_object('name', 'StartFailed', 'message', SQLERRM)
+             WHERE t.id = c.id;
+        END;
     END LOOP;
 END $$;
 
@@ -713,7 +765,7 @@ BEGIN
     FOR t IN
         SELECT x.id FROM txn.transactions x
          WHERE x.status = 'running' AND x.name IS NULL
-           AND x.lease_until < txn._now() - pg_catalog.make_interval(secs => p_grace_ms / 1000.0)
+           AND txn._lease_expired(x.id, p_grace_ms)
          FOR UPDATE SKIP LOCKED
     LOOP
         UPDATE txn.effects
@@ -724,7 +776,7 @@ BEGIN
         PERFORM txn._orphan(t.id, '{}', NULL);
         DELETE FROM txn.keys WHERE tx_id = t.id;
         UPDATE txn.transactions
-           SET status = 'abandoned', owner = NULL, lease_until = NULL, updated_at = txn._now(),
+           SET status = 'abandoned', owner = NULL, updated_at = txn._now(),
                finished_at = txn._now(),
                error = pg_catalog.jsonb_build_object('name', 'AbandonedTransaction',
                        'message', 'the process running this inline transaction stopped before it committed')
@@ -752,8 +804,8 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 CREATE VIEW txn.running_transactions AS
-    SELECT id, name, keys, owner, runs, lease_until, created_at, clock_timestamp() - created_at AS age
-      FROM txn.transactions WHERE status = 'running';
+    SELECT t.id, t.name, t.keys, t.owner, t.runs, l.lease_until, t.created_at, clock_timestamp() - t.created_at AS age
+      FROM txn.transactions t LEFT JOIN txn.leases l ON l.tx_id = t.id WHERE t.status = 'running';
 
 CREATE VIEW txn.effect_errors AS
     SELECT a.effect_id, e.tx_id, e.kind, e.name, a.attempt, a.outcome, a.error,
@@ -795,7 +847,8 @@ BEGIN
     END IF;
 
     SELECT pg_catalog.count(*) INTO n FROM txn.transactions t
-     WHERE t.status = 'running' AND t.lease_until < txn._now() - interval '1 minute';
+     WHERE t.status = 'running' AND t.created_at < txn._now() - interval '1 minute'
+       AND txn._lease_expired(t.id, 60000);
     IF n > 0 THEN
         RETURN QUERY SELECT 'stalled transactions', 'warning',
             pg_catalog.format('%s transaction(s) not driven by any process for over a minute (no worker defines them?)', n);

@@ -37,6 +37,11 @@ defmodule PgTxn.DJSON do
         p = if path == "", do: k, else: "#{path}.#{k}"
         {check_string!(k, p, "object key"), to_tagged(v, p)}
       end)
+
+    # %{"a" => 1, a: 2}: two keys with one text
+    if map_size(out) != map_size(m) do
+      raise ArgumentError, "a map has two keys with the same text (e.g. an atom and a string) at #{path_text(path)}"
+    end
     case Map.keys(out) do
       [k] when k in @tags -> %{"$escape" => out}
       _ -> out

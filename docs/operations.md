@@ -83,7 +83,10 @@ effects stay until purged:
 SELECT * FROM txn.purge(interval '30 days');   -- at most 10000 of each per call; repeat while full
 ```
 
-Run it periodically (pg_cron, or a job in your application).
+Run it periodically (pg_cron, or a job in your application). A purged
+transaction's id is forgotten: a later call with the same id runs again, so
+keep finished transactions at least as long as clients may retry with the
+same id.
 
 ## Upgrades
 

@@ -15,12 +15,12 @@
 // that reaches the end commits everything at once. See docs/protocol.md.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { type Db, type TransactionOptions, isPgPool, pgDb } from "./db.ts";
+import { type Db, type TransactionOptions, isPgPool, isolationLevel, pgDb } from "./db.ts";
 import {
   EffectFailedError, FencedError, KeyTimeoutError, PermanentError, RetryableError, TransactionFailedError,
   errorJson, sqlDetail, sqlState,
 } from "./errors.ts";
-import { fromTagged, toTagged } from "./serialize.ts";
+import { fromTagged, serialize, toTagged } from "./serialize.ts";
 import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 
 export * from "./errors.ts";
@@ -160,7 +160,15 @@ const json = (v: unknown) => JSON.stringify(toTagged(v));
 // pg_txn transactions live seconds to minutes: a longer retry delay fails the effect instead
 const MAX_RETRY_AFTER_MS = 15 * 60_000;
 
-const keyText = (k: TxKey) => (typeof k === "string" ? k : JSON.stringify(k));
+// a key's text: a string as is, anything else as canonical JSON (sorted object
+// keys), so that equal keys match whatever their key order or client
+const keyText = (k: TxKey) => {
+  if (typeof k === "string") return k;
+  if (k === null || typeof k !== "object") throw new TypeError(`pg_txn: a key must be a string, an array or an object, got ${String(k)}`);
+  const text = serialize(k);
+  if (/"\$undefined"/.test(text)) throw new TypeError(`pg_txn: a key contains undefined: ${text}`);
+  return text;
+};
 const keysOf = (o: { key?: TxKey; keys?: readonly TxKey[] }) => {
   const all = [...(o.key === undefined ? [] : [o.key]), ...(o.keys ?? [])].map(keyText);
   return all.length ? all : null;
@@ -390,6 +398,7 @@ export class PgTxn<T = any> {
    * throws its error) without running fn again.
    */
   async transaction<R>(fn: (tx: Tx<T>) => Promise<R> | R, options: RunOptions = {}): Promise<R> {
+    isolationLevel(options.isolation);
     return this.#active(async () => {
       await this.ready();
       const id = options.id ?? randomUUID();
@@ -415,6 +424,7 @@ export class PgTxn<T = any> {
       if (r.existing) return "existing";
       if (!r.holder) return new Date(r.created_at);
       await this.#waitFor(r.holder, () => {
+        if (this.#closing) throw new Error("pg_txn: this PgTxn is closed (while waiting for a key)");
         if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys!.join(", "), r.holder, Date.now() - since);
       });
     }
@@ -441,6 +451,7 @@ export class PgTxn<T = any> {
   async enqueue(name: string, input: unknown,
                 options: { trx?: T; id?: string; key?: TxKey; keys?: readonly TxKey[]; isolation?: TransactionOptions["isolation"] } = {}): Promise<string> {
     this.#open();
+    isolationLevel(options.isolation);
     await this.ready();
     const r = await this.db.query(options.trx ?? null, "SELECT txn.enqueue($1, $2::jsonb, $3, $4::text[], $5) AS id",
       [name, json(input), options.id ?? null, keysOf(options), options.isolation ?? null]);
@@ -491,18 +502,15 @@ export class PgTxn<T = any> {
   }
 
   async #drive(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
-    // keeps the lease for as long as this process drives the transaction (a
-    // no-op until the transaction has a durable record); not while a run is
-    // open: under repeatable read or serializable, the run's own update of
-    // the row would then fail to serialize
-    const state = { inRun: false };
+    // keeps the lease for as long as this process drives the transaction,
+    // runs included (a no-op until the transaction has a durable record; the
+    // lease is its own row, so this never conflicts with a run)
     const heartbeat = setInterval(() => {
-      if (state.inRun) return;
       this.db.query(null, "SELECT txn.heartbeat($1, $2, $3)", [txId, this.owner, this.#opts.leaseMs]).catch(() => {});
     }, Math.max(1000, this.#opts.leaseMs / 3));
     this.#driving.add(txId);
     try {
-      return await this.#runs(txId, fn, startedAt, options, state);
+      return await this.#runs(txId, fn, startedAt, options);
     } finally {
       clearInterval(heartbeat);
       this.#driving.delete(txId);
@@ -525,14 +533,13 @@ export class PgTxn<T = any> {
     }
   }
 
-  async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions, state: { inRun: boolean }): Promise<any> {
+  async #runs(txId: string, fn: (tx: Tx<T>) => unknown, startedAt: Date, options: TransactionOptions): Promise<any> {
     let retries = 0;
     let runs = 0;
     for (;;) {
       const run = new Run<T>(this, txId, startedAt);
       runs++;
       try {
-        state.inRun = true;
         const out = await this.db.transaction(async (trx) => {
           run.db = trx;
           try {
@@ -545,7 +552,7 @@ export class PgTxn<T = any> {
             // before the COMMIT or ROLLBACK: from now on this run's tx refuses queries
             run.closed = true;
           }
-        }, options).finally(() => { state.inRun = false; });
+        }, options);
         run.closed = true;
         run.ended = true;
         if (run.spawned.length) this.#wake?.();
@@ -737,7 +744,7 @@ export class PgTxn<T = any> {
             const fn = this.#definitions.get(t.name)!;
             const input = fromTagged(t.input);
             running++;
-            this.#track(this.#drive(t.id, (tx) => fn(tx, input), new Date(t.created_at), t.isolation ? { isolation: t.isolation } : {})
+            this.#track(this.#drive(t.id, (tx) => fn(tx, input), new Date(t.created_at), { isolation: isolationLevel(t.isolation) })
               .catch((e) => { if (!(e instanceof FencedError)) this.#opts.onError(e); })
               .finally(() => { running--; this.#wake?.(); }));
           }

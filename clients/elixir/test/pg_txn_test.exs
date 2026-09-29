@@ -1115,4 +1115,46 @@ defmodule PgTxnTest do
     assert {:ok, "first"} = PgTxn.transaction(Repo, fn _ -> "first" end, id: id2)
     assert {:ok, "first"} = PgTxn.transaction(Repo, fn _ -> "second" end, id: id2)
   end
+
+  test "the lease is renewed while a long run is open" do
+    {:ok, fresh} =
+      PgTxn.transaction(Repo, fn _tx ->
+        Process.sleep(2_500)
+        id = Repo.query!("SELECT current_setting('txn.current')").rows |> hd() |> hd()
+        # from another connection: this run's snapshot is older
+        Task.async(fn -> Repo.query!("SELECT lease_until > clock_timestamp() FROM txn.leases WHERE tx_id = $1::text::uuid", [id]).rows end)
+        |> Task.await()
+      end, id: Ecto.UUID.generate(), lease_ms: 1_500, isolation: :repeatable_read)
+
+    assert fresh == [[true]]
+  end
+
+  test "a transaction waiting for a key stops with a clear error once the worker shuts down" do
+    start_supervised!(PgTxn.DrainRepo)
+    test = self()
+    key = "shutdown:#{insert_order()}"
+
+    holder =
+      Task.async(fn ->
+        PgTxn.transaction(Repo, fn tx -> PgTxn.effect(tx, fn -> send(test, :holding); Process.sleep(1_500); :ok end) end, key: key)
+      end)
+
+    assert_receive :holding, 5_000
+
+    waiter =
+      Task.async(fn ->
+        try do
+          PgTxn.transaction(PgTxn.DrainRepo, fn _ -> send(test, :ran); :ran end, key: key)
+        rescue
+          e in ArgumentError -> {:refused, Exception.message(e)}
+        end
+      end)
+
+    Process.sleep(200)
+    :ok = stop_supervised(PgTxn.DrainRepo)
+    assert {:refused, msg} = Task.await(waiter, 5_000)
+    assert msg =~ "shutting down" or msg =~ "no PgTxn.Worker"
+    assert {:ok, "ok"} = Task.await(holder, 5_000)
+    refute_received :ran
+  end
 end

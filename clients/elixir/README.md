@@ -67,9 +67,12 @@ committed and completed effects are compensated.
 | `:isolation` | the database's | `:read_committed`, `:repeatable_read` or `:serializable`, for every run |
 | `:id` | a new uuid | the transaction id; idempotent: an id that already exists is not run again, its outcome is returned (`{:ok, output}`, or `{:error, %PgTxn.TransactionFailedError{}}`) |
 
-A key is a string, used as is, or any JSON-able term: `{"order", 42}` and
-`["order", 42]` are both stored as `["order",42]`, the same key as in the
-other clients. A transaction that waits longer than `:key_wait_ms` raises
+A key is a string, used as is, or any other durable value, stored as its
+canonical JSON text (tuples as arrays, object keys sorted, no spaces), the
+same key as in the other clients: `{"order", 42}` and `["order", 42]` are
+both `["order",42]`; `%{b: 1, a: 2}` and `%{"a" => 2, "b" => 1}` are both
+`{"a":2,"b":1}`. `nil`, and terms that are not durable values, raise an
+`ArgumentError`. A transaction that waits longer than `:key_wait_ms` raises
 `PgTxn.KeyTimeoutError`. Other options go to `Repo.transaction/2`.
 
 Use `tx` only in the transaction function, in the process running it. Using it
@@ -160,5 +163,18 @@ config :my_app, MyApp.Repo, pg_txn: [concurrency: 32]
 | `:poll_ms` | 250 | idle poll interval |
 | `:drain_ms` | 30000 | how long shutdown waits for work in progress |
 | `:install` | `true` | install the `txn` schema if it is missing |
+
+## Testing with the Ecto SQL Sandbox
+
+In `:manual` or shared sandbox mode every Repo call of a test runs inside
+one sandbox transaction, so `PgTxn.transaction` raises "cannot run inside
+another Repo transaction": each of its runs must commit or roll back on its
+own, and effects and spawns run outside of it. Run the tests that use
+pg_txn without the sandbox: `async: false`, with the sandbox in `:auto` mode
+for them (`Ecto.Adapters.SQL.Sandbox.mode(Repo, :auto)`), cleaning up the
+rows they create (e.g. `TRUNCATE` in `on_exit`). The same goes for
+`PgTxn.spawn(Repo, ...)` and `PgTxn.enqueue(Repo, ...)`: nothing commits in
+the sandbox, so the worker (which uses connections of its own) would never
+see them.
 
 More in [docs/operations.md](../../docs/operations.md).

@@ -24,7 +24,22 @@ defmodule PgTxn.Schema do
     if :persistent_term.get({__MODULE__, repo}, false) do
       :ok
     else
-      Task.async(fn -> install!(repo) end) |> Task.await(:infinity)
+      result =
+        PgTxn.Proc.async(fn ->
+          try do
+            install!(repo)
+          catch
+            kind, reason -> {:raise, kind, reason, __STACKTRACE__}
+          end
+        end)
+        |> PgTxn.Proc.await()
+
+      case result do
+        {:ok, {:raise, kind, reason, stack}} -> :erlang.raise(kind, reason, stack)
+        {:ok, _} -> :ok
+        {:exit, reason} -> exit(reason)
+      end
+
       :persistent_term.put({__MODULE__, repo}, true)
     end
   end

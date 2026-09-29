@@ -72,7 +72,7 @@ describe("holds: keys", () => {
     const key = `fenced:${id}`;
     const pa = a.run("fenced-key", {}, { id, key }).catch((e) => e.name);
     await sleep(300);
-    await pool.query("UPDATE txn.transactions SET lease_until = now() - interval '1 second' WHERE id = $1", [id]);
+    await pool.query("UPDATE txn.leases SET lease_until = now() - interval '1 second' WHERE tx_id = $1", [id]);
     b.define("fenced-key", def("B"));
     assert.equal(await b.wait(id, 15_000), "ok");
     release();

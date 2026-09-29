@@ -25,7 +25,7 @@ describe("holds: SQL functions with bad inputs", () => {
     assert.equal(await q("SELECT txn.prepare_effects(gen_random_uuid(), gen_random_uuid(), 1000, '[{\"seq\":\"a\"}]')"), "ERR 22P02");
     assert.deepEqual(await q("SELECT txn.effect_done(gen_random_uuid(), gen_random_uuid(), true) AS r"), [{ r: { status: "unknown" } }]);
     assert.deepEqual(await q("SELECT txn.finish(gen_random_uuid(), gen_random_uuid(), '{}') AS n"), [{ n: 0 }]);
-    assert.equal(await q("SELECT * FROM txn.start(gen_random_uuid(), NULL, NULL, gen_random_uuid(), 1000, ARRAY[NULL::text])"), "ERR 23502");
+    assert.equal(await q("SELECT * FROM txn.start(gen_random_uuid(), NULL, NULL, gen_random_uuid(), 1000, ARRAY[NULL::text])"), "ERR 22004");   // null_value_not_allowed: txn._check_keys
     assert.equal(await q("SELECT txn.spawn(gen_random_uuid(), 'x', NULL, 0)"), "ERR 23514");
     assert.equal(await q("SELECT * FROM txn.lease_effects(gen_random_uuid(), -1, 1000)"), "ERR 2201W");
     assert.equal((await q("SELECT txn.complete_effect(gen_random_uuid(), gen_random_uuid(), 0, 'null') AS ok") as any)[0].ok, false);
@@ -64,7 +64,7 @@ describe("holds: SQL functions with bad inputs", () => {
     assert.equal(by.schema, "ok");
     assert.equal(by.workers, "ok");
     await pool.query("SELECT txn.enqueue('nobody-defines-this')");
-    await pool.query("UPDATE txn.transactions SET lease_until = now() - interval '2 minutes' WHERE name = 'nobody-defines-this'");
+    await pool.query("UPDATE txn.transactions SET created_at = now() - interval '2 minutes' WHERE name = 'nobody-defines-this'");
     const again = (await pool.query("SELECT check_name, status FROM txn.doctor()")).rows;
     assert.ok(again.some((r) => r.check_name === "stalled transactions" && r.status === "warning"));
     await pool.query("DELETE FROM txn.transactions WHERE name = 'nobody-defines-this'");

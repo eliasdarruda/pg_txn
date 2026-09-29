@@ -62,7 +62,7 @@ describe("isolation levels", () => {
     const pa = a.run("iso", {}, { id, isolation: "serializable" }).catch((e) => e.name);
     await waitFor(async () => seen.A, "A's first run");
     // A stalls: its lease lapses and B, which defines the same name, resumes it
-    await pool.query("UPDATE txn.transactions SET lease_until = now() - interval '1 second' WHERE id = $1", [id]);
+    await pool.query("UPDATE txn.leases SET lease_until = now() - interval '1 second' WHERE tx_id = $1", [id]);
     b.define("iso", def("B"));
     await waitFor(async () => seen.B, "B's run");
     release();
