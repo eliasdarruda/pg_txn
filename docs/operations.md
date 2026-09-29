@@ -92,4 +92,6 @@ same id.
 
 The schema is versioned (`txn.meta`). Deploy clients built for the new
 version after running the new version's migration (or let the first new
-client install it); clients refuse a version they were not built for.
+client install it); clients refuse a version they were not built for. Every
+schema change bumps the version: `scripts/sync-schema.mjs` refuses a changed
+schema file with an unchanged version (`extension/sql/versions.lock`).

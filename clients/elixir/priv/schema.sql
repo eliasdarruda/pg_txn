@@ -37,7 +37,7 @@ CREATE SCHEMA txn;
 CREATE TABLE txn.meta (
     version integer NOT NULL
 );
-INSERT INTO txn.meta VALUES (1);
+INSERT INTO txn.meta VALUES (2);
 
 -- ---------------------------------------------------------------------------
 -- durable state
@@ -403,6 +403,22 @@ BEGIN
     IF e.status <> 'running' OR t.owner IS DISTINCT FROM p_owner OR t.status <> 'running' THEN
         INSERT INTO txn.effect_attempts (effect_id, attempt, outcome, error, owner, started_at)
         VALUES (e.id, e.attempts, 'stale', p_error, p_owner, e.leased_at);
+        -- a late call that succeeded after the transaction gave up on it (its
+        -- process lost the lease, the effect was orphaned or failed as
+        -- ambiguous): the external change happened and nobody will use it, so
+        -- its result is kept and, if it has one, its compensation scheduled,
+        -- run by this (late but alive) process, which has the function
+        IF p_ok AND e.result IS NULL AND e.status IN ('orphaned', 'failed') THEN
+            UPDATE txn.effects SET result = p_result, updated_at = txn._now() WHERE id = e.id;
+            IF e.compensation IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM txn.effects c WHERE c.compensates = e.id) THEN
+                INSERT INTO txn.effects (tx_id, kind, name, input, compensates, max_attempts, delivery, local_owner)
+                VALUES (e.tx_id, 'compensation', e.compensation,
+                        pg_catalog.jsonb_build_object('effect', e.name, 'input', e.input, 'result', p_result),
+                        e.id, e.max_attempts, e.delivery, p_owner);
+                RETURN pg_catalog.jsonb_build_object('status', 'stale', 'compensate', true);
+            END IF;
+        END IF;
         RETURN pg_catalog.jsonb_build_object('status', 'stale');
     END IF;
     IF p_ok THEN
@@ -527,6 +543,12 @@ DECLARE
     h uuid;
 BEGIN
     PERFORM txn._check_keys(p_keys);
+    -- an attempt with this id that failed or was abandoned before any effect
+    -- succeeded changed nothing outside: it may run again (a retried request
+    -- after, e.g., a lock timeout); otherwise its outcome is final
+    DELETE FROM txn.transactions x
+     WHERE x.id = p_tx AND x.status IN ('failed', 'abandoned')
+       AND NOT EXISTS (SELECT 1 FROM txn.effects e WHERE e.tx_id = x.id AND e.result IS NOT NULL);
     INSERT INTO txn.transactions (id, name, input, keys, isolation, owner, generation)
     VALUES (p_tx, p_name, p_input, p_keys, p_isolation, p_owner, 1)
     ON CONFLICT (id) DO NOTHING
@@ -743,12 +765,19 @@ BEGIN
              WHERE t.id = c.id
             RETURNING t.id, t.name, t.input, t.runs, t.created_at, t.isolation;
             n := n + 1;
-        EXCEPTION WHEN OTHERS THEN
-            -- a transaction that cannot be started fails; it never blocks the others
-            UPDATE txn.transactions t
-               SET status = 'failed', owner = NULL, updated_at = txn._now(), finished_at = txn._now(),
-                   error = pg_catalog.jsonb_build_object('name', 'StartFailed', 'message', SQLERRM)
-             WHERE t.id = c.id;
+        EXCEPTION
+            -- transient, for this candidate: it stays queued for a later poll
+            WHEN lock_not_available OR serialization_failure OR deadlock_detected THEN
+                NULL;
+            -- the statement itself is cancelled: stop
+            WHEN query_canceled OR admin_shutdown OR crash_shutdown OR cannot_connect_now THEN
+                RAISE;
+            WHEN OTHERS THEN
+                -- a transaction that can never be started fails; it never blocks the others
+                UPDATE txn.transactions t
+                   SET status = 'failed', owner = NULL, updated_at = txn._now(), finished_at = txn._now(),
+                       error = pg_catalog.jsonb_build_object('name', 'StartFailed', 'message', SQLERRM, 'sqlstate', SQLSTATE)
+                 WHERE t.id = c.id;
         END;
     END LOOP;
 END $$;

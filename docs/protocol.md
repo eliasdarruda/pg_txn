@@ -89,7 +89,7 @@ catches the abort.
 ### perform (outside any transaction)
 
 ```
-heartbeat every lease/3, not while a run is open: SELECT txn.heartbeat(tx_id, owner, lease_ms)
+heartbeat every lease/3, runs included: SELECT txn.heartbeat(tx_id, owner, lease_ms)   -- touches txn.leases only
 r := SELECT txn.prepare_effects(tx_id, owner, lease_ms, effects)
      effects: [{seq, name, input: deps, max_attempts, delivery, compensation}]
   r.conflict (fenced) → stop

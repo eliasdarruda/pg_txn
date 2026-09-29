@@ -34,7 +34,7 @@ background transactions it runs.
 Other libraries:
 
 ```ts
-new PgTxn(pool)             // a node-postgres Pool; tx.db is a PoolClient
+new PgTxn(pool)             // a node-postgres Pool; tx.db is its client (typed PgClient)
 new PgTxn(knexDb(knex))     // tx.db is the Knex transaction (Objection works on it)
 ```
 
@@ -91,7 +91,7 @@ Runs `fn(tx)` as one transaction that may include effects, and returns what
 |---|---|
 | `key` | transactions with the same key run one at a time; the others wait, holding nothing. A string, or JSON such as `["order", id]` (compared as canonical JSON: object key order does not matter). |
 | `keys` | several keys, claimed all at once or none (no deadlocks), e.g. `[["account", from], ["account", to]]` |
-| `id` | the transaction id. Idempotent: an id that already ended returns its recorded output (or throws its error) without running `fn` again, so a retried request is safe. |
+| `id` | the transaction id. Idempotent: an id that committed returns its recorded output without running `fn` again, so a retried request is safe. An id that failed after an effect ran throws its error again (use a new id to try again); one that failed before any effect ran, e.g. on a lock timeout, simply runs again. |
 | `isolation` | e.g. `"serializable"` |
 
 Without a key, concurrency is optimistic. Every run re-reads your data, so

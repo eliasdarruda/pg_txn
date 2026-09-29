@@ -39,7 +39,7 @@ defmodule PgTxnTest do
     assert scalar("SELECT version FROM txn.meta") == PgTxn.Schema.version()
     # the worker reports itself and is woken by NOTIFY
     assert scalar("SELECT count(*) FROM txn.workers") >= 1
-    assert scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'LISTEN%txn_effects%'") == 1
+    assert scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'LISTEN%txn_%'") == 1
   end
 
   test "memoization: N effects run the function N+1 times and each effect once" do
@@ -1156,5 +1156,44 @@ defmodule PgTxnTest do
     assert msg =~ "shutting down" or msg =~ "no PgTxn.Worker"
     assert {:ok, "ok"} = Task.await(holder, 5_000)
     refute_received :ran
+  end
+
+  # as tests/adversarial/r3-scenarios.test.ts: each transaction reads, calls
+  # an effect and writes (~10 ms of work with its two runs)
+  test "100 concurrent transactions on one key run at >= 50 per second" do
+    id = insert_order()
+    t0 = System.monotonic_time(:millisecond)
+
+    results =
+      for _ <- 1..100 do
+        Task.async(fn ->
+          PgTxn.transaction(Repo, fn tx ->
+            n = order(id).amount
+            PgTxn.effect(tx, fn -> "t#{n}" end, deps: [n])
+            Repo.query!("UPDATE orders SET amount = $2 WHERE id = $1", [id, n + 1])
+            :ok
+          end, key: ["contended", id])
+        end)
+      end
+      |> Task.await_many(60_000)
+
+    ms = System.monotonic_time(:millisecond) - t0
+    assert Enum.all?(results, &match?({:ok, _}, &1))
+    assert order(id).amount == 100
+    assert 100 * 1000 / ms >= 50, "#{Float.round(100 * 1000 / ms, 1)} tx/s"
+  end
+
+  test "a spawn in a transaction with no durable row gets its tx id in ctx" do
+    test = self()
+    {:ok, tx_id} = PgTxn.transaction(Repo, fn tx -> PgTxn.spawn(tx, fn ctx -> send(test, {:ctx_tx, ctx.tx_id}); :ok end); tx.id end)
+    assert_receive {:ctx_tx, ^tx_id}, 5_000
+  end
+
+  test "shutdown does not wait for a spawn delayed beyond the drain window" do
+    start_supervised!(PgTxn.DrainRepo)
+    PgTxn.spawn(PgTxn.DrainRepo, fn -> :ok end, delay_ms: 3_600_000)
+    t0 = System.monotonic_time(:millisecond)
+    :ok = stop_supervised(PgTxn.DrainRepo)
+    assert System.monotonic_time(:millisecond) - t0 < 2_000
   end
 end

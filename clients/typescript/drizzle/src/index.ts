@@ -5,7 +5,7 @@
 //     await tx.db.update(orders).set({ status: "paid" }).where(eq(orders.id, id))   // tx.db: the Drizzle transaction
 //   })
 import { sql, type SQL } from "drizzle-orm";
-import type { Db, TransactionOptions } from "@pg-txn/client";
+import { type Db, type TransactionOptions, isPgPool, pgDb } from "@pg-txn/client";
 
 type Executor = { execute(query: SQL): Promise<unknown> };
 type DrizzleDb = Executor & {
@@ -36,7 +36,11 @@ function toSql(text: string, params: unknown[]): SQL {
 
 /** A pg_txn Db for a Drizzle database; tx.db is the Drizzle transaction. */
 export function drizzleDb<D extends DrizzleDb>(db: D): Db<Parameters<Parameters<D["transaction"]>[0]>[0]> {
+  // on a node-postgres Pool, LISTEN wake-ups work as with a plain Pool
+  const client = (db as { $client?: unknown }).$client;
+  const listen = isPgPool(client) ? pgDb(client).listen : undefined;
   return {
+    listen,
     transaction: (fn, options) => db.transaction(fn, options?.isolation ? { isolationLevel: options.isolation } : undefined),
     async query(trx, text, params) {
       return { rows: rowsOf(await ((trx as Executor | null) ?? db).execute(toSql(text, params))) };

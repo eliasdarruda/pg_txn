@@ -71,8 +71,10 @@ A key is a string, used as is, or any other durable value, stored as its
 canonical JSON text (tuples as arrays, object keys sorted, no spaces), the
 same key as in the other clients: `{"order", 42}` and `["order", 42]` are
 both `["order",42]`; `%{b: 1, a: 2}` and `%{"a" => 2, "b" => 1}` are both
-`{"a":2,"b":1}`. `nil`, and terms that are not durable values, raise an
-`ArgumentError`. A transaction that waits longer than `:key_wait_ms` raises
+`{"a":2,"b":1}`; `42` is `42` (the same key as `"42"`). `nil`, and terms
+that are not durable values, raise an `ArgumentError`. Transactions of one
+node that share a key wait in line on the node (first come, first served);
+across nodes, a waiter is woken when the holder ends (`NOTIFY txn_done`). A transaction that waits longer than `:key_wait_ms` raises
 `PgTxn.KeyTimeoutError`. Other options go to `Repo.transaction/2`.
 
 Use `tx` only in the transaction function, in the process running it. Using it

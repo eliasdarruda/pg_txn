@@ -108,12 +108,13 @@ defmodule PgTxn.AdversarialTest do
   # returns the stored output: {:ok, nil}, which the caller cannot tell from a
   # transaction that returned nil.
   # Fixed as in the TypeScript client: with an :id (or named), an output
-  # that cannot be stored fails the transaction.
+  # that cannot be stored fails the transaction. Since round 3 an id that
+  # failed with no effect result recorded runs again (txn.start).
   test "an idempotent re-call of a transaction whose output is not durable does not return {:ok, nil}" do
     id = Ecto.UUID.generate()
     assert_raise ArgumentError, ~r/output cannot be stored/, fn -> PgTxn.transaction(Repo, fn _tx -> {:paid, 7} end, id: id) end
-    second = PgTxn.transaction(Repo, fn _tx -> flunk("ran again") end, id: id)
-    assert {:error, %PgTxn.TransactionFailedError{status: "failed"}} = second
+    second = PgTxn.transaction(Repo, fn _tx -> "second" end, id: id)
+    assert second == {:ok, "second"}
     refute match?({:ok, nil}, second), "the retried call got #{inspect(second)}"
   end
 

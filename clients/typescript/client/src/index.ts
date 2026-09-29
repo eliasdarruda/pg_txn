@@ -15,7 +15,7 @@
 // that reaches the end commits everything at once. See docs/protocol.md.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { type Db, type TransactionOptions, isPgPool, isolationLevel, pgDb } from "./db.ts";
+import { type Db, type PgClient, type TransactionOptions, isPgPool, isolationLevel, pgDb } from "./db.ts";
 import {
   EffectFailedError, FencedError, KeyTimeoutError, PermanentError, RetryableError, TransactionFailedError,
   errorJson, sqlDetail, sqlState,
@@ -24,7 +24,7 @@ import { fromTagged, serialize, toTagged } from "./serialize.ts";
 import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema.ts";
 
 export * from "./errors.ts";
-export { pgDb, isPgPool, type Db, type TransactionOptions, type QueryResult } from "./db.ts";
+export { pgDb, isPgPool, type Db, type PgClient, type TransactionOptions, type QueryResult } from "./db.ts";
 export { SerializationError } from "./serialize.ts";
 
 export type Retry = boolean | {
@@ -32,7 +32,13 @@ export type Retry = boolean | {
   attempts?: number;
 };
 
-const attemptsOf = (r: Retry | undefined) => (!r ? 1 : r === true ? 5 : Math.max(1, r.attempts ?? 5));
+const attemptsOf = (r: Retry | undefined) => {
+  if (!r) return 1;
+  if (r === true) return 5;
+  const n = r.attempts ?? 5;
+  if (!Number.isInteger(n) || n < 1 || n > 1000) throw new TypeError(`pg_txn: retry.attempts must be an integer from 1 to 1000, got ${n}`);
+  return n;
+};
 const deliveryOf = (r: Retry | undefined) => (r ? "at-least-once" : "at-most-once");
 
 export type EffectOptions = {
@@ -130,7 +136,7 @@ export type PgTxnOptions = {
 };
 
 /** A transaction key: a string, or JSON (e.g. ["order", 42]). */
-export type TxKey = string | readonly unknown[] | Record<string, unknown>;
+export type TxKey = string | number | boolean | readonly unknown[] | Record<string, unknown>;
 
 export type RunOptions = TransactionOptions & {
   id?: string;
@@ -164,7 +170,9 @@ const MAX_RETRY_AFTER_MS = 15 * 60_000;
 // keys), so that equal keys match whatever their key order or client
 const keyText = (k: TxKey) => {
   if (typeof k === "string") return k;
-  if (k === null || typeof k !== "object") throw new TypeError(`pg_txn: a key must be a string, an array or an object, got ${String(k)}`);
+  if (k === null || k === undefined || typeof k === "function" || typeof k === "symbol") {
+    throw new TypeError(`pg_txn: a key must be a string, number, boolean, array or object, got ${String(k)}`);
+  }
   const text = serialize(k);
   if (/"\$undefined"/.test(text)) throw new TypeError(`pg_txn: a key contains undefined: ${text}`);
   return text;
@@ -211,10 +219,10 @@ class Run<T> implements Tx<T> {
   #uuids = 0;
   #db!: T;
   readonly id: string;
-  private core: PgTxn;
+  private core: PgTxn<any>;
   private startedAt: Date;
 
-  constructor(core: PgTxn, id: string, startedAt: Date) {
+  constructor(core: PgTxn<any>, id: string, startedAt: Date) {
     this.core = core;
     this.id = id;
     this.startedAt = startedAt;
@@ -297,7 +305,7 @@ class Run<T> implements Tx<T> {
   }
 }
 
-export class PgTxn<T = any> {
+export class PgTxn<T = PgClient> {
   readonly db: Db<T>;
   /** This process's identity in leases. */
   readonly owner = randomUUID();
@@ -312,6 +320,9 @@ export class PgTxn<T = any> {
   #closed = false;
   #closing = false;
   #leaseNow = false;
+  #keyTails = new Map<string, Promise<void>>();
+  // callers waiting for a transaction to end, woken by NOTIFY txn_done
+  #doneWaiters = new Map<string, Set<() => void>>();
   #calls = 0;
   #wake: (() => void) | null = null;
   #worker: Promise<void> | null = null;
@@ -404,9 +415,11 @@ export class PgTxn<T = any> {
       const id = options.id ?? randomUUID();
       // without an id or keys there is nothing to arbitrate: no durable record until an effect
       if (options.id === undefined && !keysOf(options)) return this.#drive(id, (tx) => fn(tx), new Date(), options);
-      const started = await this.#start(id, null, null, options);
-      if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
-      return this.#drive(id, (tx) => fn(tx), started, options);
+      return this.#queued(keysOf(options), async () => {
+        const started = await this.#start(id, null, null, options);
+        if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
+        return this.#drive(id, (tx) => fn(tx), started, options);
+      });
     });
   }
 
@@ -423,10 +436,15 @@ export class PgTxn<T = any> {
         [id, name, name === null ? null : json(input), this.owner, this.#opts.leaseMs, keys, options.isolation ?? null])).rows[0];
       if (r.existing) return "existing";
       if (!r.holder) return new Date(r.created_at);
-      await this.#waitFor(r.holder, () => {
-        if (this.#closing) throw new Error("pg_txn: this PgTxn is closed (while waiting for a key)");
-        if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys!.join(", "), r.holder, Date.now() - since);
-      });
+      // wait for the holder, then for whoever took a key next, and only try
+      // to start once the keys are free (waiters do not all insert at once)
+      for (let holder: string | undefined = r.holder; holder;) {
+        await this.#waitFor(holder, () => {
+          if (this.#closing) throw new Error("pg_txn: this PgTxn is closed (while waiting for a key)");
+          if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys!.join(", "), holder!, Date.now() - since);
+        });
+        holder = (await this.db.query(null, "SELECT tx_id FROM txn.keys WHERE key = ANY ($1::text[]) LIMIT 1", [keys])).rows[0]?.tx_id;
+      }
     }
   }
 
@@ -437,9 +455,11 @@ export class PgTxn<T = any> {
     return this.#active(async () => {
       await this.ready();
       const id = options.id ?? randomUUID();
-      const started = await this.#start(id, name, input, options);
-      if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
-      return this.#drive(id, (tx) => fn(tx, input), started, options) as Promise<R>;
+      return this.#queued(keysOf(options), async () => {
+        const started = await this.#start(id, name, input, options);
+        if (started === "existing") return this.wait<R>(id, this.#opts.keyWaitMs);
+        return this.#drive(id, (tx) => fn(tx, input), started, options) as Promise<R>;
+      });
     });
   }
 
@@ -472,6 +492,36 @@ export class PgTxn<T = any> {
     await this.db.query(options.trx ?? null, "SELECT txn.spawn($1, $2, $3, $4, $5, $6)", spawnParams(this.owner, fn, id, options));
     this.#wake?.();
     return id;
+  }
+
+  // Transactions of this process with a key in common run in order, one at
+  // a time: only the first in line claims the keys in the database, so a
+  // hand-off wakes one caller, not every waiter (keys in sorted order: no
+  // cycles). Waiting here counts toward keyWaitMs.
+  async #queued<R>(keys: string[] | null, f: () => Promise<R>): Promise<R> {
+    if (!keys) return f();
+    const since = Date.now();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const before: Promise<void>[] = [];
+    for (const k of [...new Set(keys)].sort()) {
+      before.push(this.#keyTails.get(k) ?? Promise.resolve());
+      this.#keyTails.set(k, mine);
+    }
+    const ahead = Promise.all(before);
+    try {
+      for (;;) {
+        const done = await Promise.race([ahead.then(() => true), sleep(250).then(() => false)]);
+        if (done) break;
+        if (this.#closing) throw new Error("pg_txn: this PgTxn is closed (while waiting for a key)");
+        if (Date.now() - since > this.#opts.keyWaitMs) throw new KeyTimeoutError(keys.join(", "), "(this process)", Date.now() - since);
+      }
+      return await f();
+    } finally {
+      // those behind wait for those ahead of this one too (it may have given up early)
+      ahead.then(release, release);
+      for (const k of keys) if (this.#keyTails.get(k) === mine) ahead.then(() => { if (this.#keyTails.get(k) === mine) this.#keyTails.delete(k); });
+    }
   }
 
   #open(): void {
@@ -618,6 +668,12 @@ export class PgTxn<T = any> {
         const done = (await this.db.query(null, "SELECT txn.effect_done($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7) AS r",
           [action.id, this.owner, outcome.ok, outcome.ok ? outcome.stored : null,
             outcome.ok ? null : JSON.stringify(outcome.error), outcome.retryable, outcome.retryAfterMs ?? null])).rows[0].r;
+        if (done.compensate) {
+          // the call succeeded too late (this process lost the transaction):
+          // its compensation was scheduled here, where the function is
+          this.#leaseNow = true;
+          this.#wake?.();
+        }
         if (done.status !== "retry_wait") return;
         await sleep(done.wait_ms);
       } else {
@@ -666,11 +722,25 @@ export class PgTxn<T = any> {
   }
 
   async #waitFor(txId: string, check: () => void): Promise<void> {
-    for (let ms = 5; ; ms = Math.min(ms * 1.5, 200)) {
-      const r = (await this.db.query(null, "SELECT status FROM txn.status($1)", [txId])).rows[0];
-      if (!r || r.status !== "running") return;
-      check();
-      await sleep(ms);
+    let wake: (() => void) | null = null;
+    const set = this.#doneWaiters.get(txId) ?? new Set();
+    const waker = () => wake?.();
+    set.add(waker);
+    this.#doneWaiters.set(txId, set);
+    try {
+      for (let ms = 5; ; ms = Math.min(ms * 1.5, 250)) {
+        const r = (await this.db.query(null, "SELECT status FROM txn.status($1)", [txId])).rows[0];
+        if (!r || r.status !== "running") return;
+        check();
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, ms);
+          wake = () => { clearTimeout(t); resolve(); };
+        });
+        wake = null;
+      }
+    } finally {
+      set.delete(waker);
+      if (!set.size) this.#doneWaiters.delete(txId);
     }
   }
 
@@ -687,16 +757,22 @@ export class PgTxn<T = any> {
     let lastSweep = 0;
     let running = 0;
     let trickle = false;
-    try {
-      await this.ready();
-    } catch (e) {
-      this.#opts.onError(e);
-      return;
+    // the database may be down at startup: keep trying (with backoff)
+    for (let ms = 500; !this.#closed; ms = Math.min(ms * 2, 10_000)) {
+      try {
+        await this.ready();
+        break;
+      } catch (e) {
+        this.#opts.onError(e);
+        await this.#idle(ms);
+      }
     }
     const listen = this.#opts.listen;
-    if (this.db.listen && listen !== false) {
-      this.#unlisten = await this.db.listen("txn_effects", () => this.#wake?.(),
-        typeof listen === "object" ? listen.connectionString : undefined).catch(() => null);
+    if (this.db.listen && listen !== false && !this.#closed) {
+      this.#unlisten = await this.db.listen(["txn_effects", "txn_done"], (channel, payload) => {
+        if (channel === "txn_effects") this.#wake?.();
+        else for (const r of this.#doneWaiters.get(payload) ?? []) r();
+      }, typeof listen === "object" ? listen.connectionString : undefined).catch(() => null);
     }
     while (!this.#closed) {
       let found = 0;
@@ -752,18 +828,21 @@ export class PgTxn<T = any> {
       } catch (e) {
         if (!this.#closed) this.#opts.onError(e);
       }
-      if (!found && !this.#closed) {
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(done, this.#opts.pollMs);
-          function done() {
-            clearTimeout(t);
-            resolve();
-          }
-          this.#wake = done;
-        });
-        this.#wake = null;
-      }
+      if (!found && !this.#closed) await this.#idle(this.#opts.pollMs);
     }
+  }
+
+  // Sleeps up to ms, or until woken (#wake).
+  async #idle(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(done, ms);
+      function done() {
+        clearTimeout(t);
+        resolve();
+      }
+      this.#wake = done;
+    });
+    this.#wake = null;
   }
 
   // Forgets functions whose effect is finished, or never became visible (its
@@ -797,7 +876,7 @@ export class PgTxn<T = any> {
     }, Math.max(1000, this.#opts.leaseMs / 3));
     try {
       const outcome = storable(await this.#call((ctx) => local.fn(ctx, e.input), { retry: e.delivery === "at-least-once", timeoutMs: local.timeoutMs },
-        e.id, e.attempt, e.tx_id, null));
+        e.id, e.attempt, e.tx_id ?? local.txId, null));
       let status = "succeeded";
       if (outcome.ok) {
         await this.db.query(null, "SELECT txn.complete_effect($1, $2, $3::bigint, $4::jsonb)", [e.id, this.owner, e.generation, outcome.stored]);
@@ -823,8 +902,9 @@ export class PgTxn<T = any> {
       this.#wake?.();
       const pending = this.#local.size
         ? Number((await this.db.query(null,
-          "SELECT count(*) AS n FROM txn.effects WHERE local_owner = $1 AND kind <> 'call' AND status IN ('pending', 'retry_wait', 'running')",
-          [this.owner]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n)
+          `SELECT count(*) AS n FROM txn.effects WHERE local_owner = $1 AND kind <> 'call' AND status IN ('pending', 'retry_wait', 'running')
+            AND (status = 'running' OR next_attempt_at < now() + make_interval(secs => $2 / 1000.0))`,
+          [this.owner, Math.max(0, deadline - Date.now())]).catch(() => ({ rows: [{ n: 0 }] }))).rows[0].n)
         : 0;
       if (!this.#calls && !this.#driving.size && !this.#busy.size && !pending) break;
       await sleep(50);

@@ -35,10 +35,17 @@ describe("holds: idempotent ids across kinds", () => {
     assert.equal(ran, false);
   });
 
-  test("the id of an abandoned transaction: TransactionFailedError (status abandoned), fn not run", async () => {
+  test("the id of a transaction abandoned after an effect ran: TransactionFailedError (status abandoned), fn not run", async () => {
     const id = crypto.randomUUID();
     await pool.query("INSERT INTO txn.transactions (id, status, finished_at, error) VALUES ($1, 'abandoned', now(), '{\"name\": \"AbandonedTransaction\"}')", [id]);
+    await pool.query("INSERT INTO txn.effects (tx_id, kind, seq, name, input_hash, status, result) VALUES ($1, 'call', 0, 'charge', 'h', 'orphaned', '{}')", [id]);
     await assert.rejects(pgtxn.transaction(async () => "ran", { id }), (e: any) => e.name === "TransactionFailedError" && e.status === "abandoned");
+  });
+
+  test("the id of a transaction abandoned before any effect ran: it runs again", async () => {
+    const id = crypto.randomUUID();
+    await pool.query("INSERT INTO txn.transactions (id, status, finished_at, error) VALUES ($1, 'abandoned', now(), '{\"name\": \"AbandonedTransaction\"}')", [id]);
+    assert.equal(await pgtxn.transaction(async () => "ran", { id }), "ran");
   });
 
   test("the id of a running inline transaction whose process is gone: the waiter gets AbandonedTransaction after lease + grace", { timeout: 30_000 }, async () => {

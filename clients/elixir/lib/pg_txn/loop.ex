@@ -47,10 +47,33 @@ defmodule PgTxn.Loop do
         drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, opts[:started_at] || DateTime.utc_now())
 
       {name, input} ->
-        case start(repo, tx_id, name, input, owner, lease_ms, keys(opts), isolation) do
-          :existing -> PgTxn.wait(repo, tx_id, Config.get(repo, :key_wait_ms))
-          started_at -> drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, started_at)
-        end
+        keys = keys(opts)
+        since = System.monotonic_time(:millisecond)
+
+        # transactions of this node sharing a key queue here first: only the
+        # first in line claims the keys in the database
+        queued(repo, keys, since, fn ->
+          case start(repo, tx_id, name, input, owner, lease_ms, keys, isolation, since) do
+            :existing -> PgTxn.wait(repo, tx_id, Config.get(repo, :key_wait_ms))
+            started_at -> drive(repo, tx_id, fun, opts, owner, lease_ms, isolation, started_at)
+          end
+        end)
+    end
+  end
+
+  defp queued(_repo, nil, _since, fun), do: fun.()
+
+  defp queued(repo, keys, since, fun) do
+    PgTxn.KeyQueue.run(repo, keys, fn -> key_check!(repo, keys, "(this node)", since) end, fun)
+  end
+
+  # raises when the worker shuts down (or stopped), or the key wait is over
+  defp key_check!(repo, keys, holder, since) do
+    Local.open!(repo)
+    waited = System.monotonic_time(:millisecond) - since
+
+    if waited > Config.get(repo, :key_wait_ms) do
+      raise KeyTimeoutError, key: Enum.join(keys, ", "), holder: holder, waited_ms: waited
     end
   end
 
@@ -157,10 +180,7 @@ defmodule PgTxn.Loop do
   # records the transaction as running (named, with keys, or with an id) and
   # returns when it started; with a key another transaction holds, waits for
   # that one to end first; with an id that exists already, returns :existing
-  defp start(repo, tx_id, name, input, owner, lease_ms, keys, isolation) do
-    wait_ms = Config.get(repo, :key_wait_ms)
-    since = System.monotonic_time(:millisecond)
-
+  defp start(repo, tx_id, name, input, owner, lease_ms, keys, isolation, since) do
     Stream.repeatedly(fn ->
       SQL.one(repo,
         "SELECT created_at, holder::text AS holder, existing FROM txn.start($1::text::uuid, $2, $3::text::jsonb, $4::text::uuid, $5, $6::text[], $7)",
@@ -174,15 +194,19 @@ defmodule PgTxn.Loop do
         created_at
 
       %{"holder" => holder} ->
-        wait_for(repo, holder, fn ->
-          # the worker is shutting down (or stopped): do not start later
-          Local.open!(repo)
-          waited = System.monotonic_time(:millisecond) - since
-          if waited > wait_ms, do: raise(KeyTimeoutError, key: Enum.join(keys, ", "), holder: holder, waited_ms: waited)
-        end)
-
+        await_keys(repo, keys, holder, since)
         nil
     end)
+  end
+
+  # waits for the holder, then for whoever took one of the keys next: only
+  # tries to start once the keys are free (waiters do not all insert at once)
+  defp await_keys(_repo, _keys, nil, _since), do: :ok
+
+  defp await_keys(repo, keys, holder, since) do
+    wait_for(repo, holder, fn -> key_check!(repo, keys, holder, since) end)
+    next = SQL.value(repo, "SELECT coalesce((SELECT tx_id::text FROM txn.keys WHERE key = ANY ($1::text[]) LIMIT 1), '')", [keys])
+    await_keys(repo, keys, if(next == "", do: nil, else: next), since)
   end
 
   defp loop(ctx, fun, retries) do
@@ -347,13 +371,19 @@ defmodule PgTxn.Loop do
     call_ctx = %{effect_id: id, idempotency_key: id, attempt: attempt, tx_id: ctx.tx_id}
     fun = need.fun
     thunk = if is_function(fun, 0), do: fun, else: fn -> fun.(call_ctx) end
-    o = Call.call(thunk, retry: !!need.opts[:retry], timeout_ms: Keyword.get(need.opts, :timeout_ms, 30_000), run: ctx.run)
+    o = Call.call(thunk, retry: !!need.opts[:retry], timeout_ms: need.opts[:timeout_ms] || 30_000, run: ctx.run)
 
     done =
       SQL.value(ctx.repo,
         "SELECT txn.effect_done($1::text::uuid, $2::text::uuid, $3, $4::text::jsonb, $5::text::jsonb, $6, $7)",
         [id, ctx.owner, o.ok, if(o.ok, do: Jason.encode!(o.result)), if(!o.ok, do: Jason.encode!(o.error)),
          o.retryable, o.retry_after_ms])
+
+    if done["compensate"] do
+      # the call succeeded too late (this driver lost the transaction): its
+      # compensation was scheduled for this driver's owner, which has the function
+      PgTxn.Worker.lease_now(ctx.repo, ctx.owner)
+    end
 
     case done do
       %{"status" => "retry_wait", "wait_ms" => ms} ->
@@ -375,17 +405,47 @@ defmodule PgTxn.Loop do
   # ------------------------------------------------------------------ helpers
 
   # waits until transaction `tx_id` is no longer running; `check` may raise
+  # woken by NOTIFY txn_done through the worker, or polling; the wait runs
+  # in a process of its own so that no late wake-up reaches the caller
   defp wait_for(repo, tx_id, check), do: wait_for(repo, tx_id, check, 5)
 
   defp wait_for(repo, tx_id, check, ms) do
-    case SQL.one(repo, "SELECT status FROM txn.status($1::text::uuid)", [tx_id]) do
-      %{"status" => "running"} ->
-        check.()
-        Process.sleep(ms)
-        wait_for(repo, tx_id, check, min(round(ms * 1.5), 200))
+    waiting =
+      PgTxn.Proc.async(fn ->
+        Local.watch_done(repo, tx_id)
 
-      _ ->
+        try do
+          case SQL.one(repo, "SELECT status FROM txn.status($1::text::uuid)", [tx_id]) do
+            %{"status" => "running"} ->
+              receive do
+                {:pg_txn_done, ^tx_id} -> :waited
+              after
+                ms -> :waited
+              end
+
+            _ ->
+              :ended
+          end
+        catch
+          kind, reason -> {:raise, kind, reason, __STACKTRACE__}
+        after
+          Local.unwatch_done(repo, tx_id)
+        end
+      end)
+
+    case PgTxn.Proc.await(waiting) do
+      {:ok, :ended} ->
         :ok
+
+      {:ok, :waited} ->
+        check.()
+        wait_for(repo, tx_id, check, min(round(ms * 1.5), 250))
+
+      {:ok, {:raise, kind, reason, stack}} ->
+        :erlang.raise(kind, reason, stack)
+
+      {:exit, reason} ->
+        exit(reason)
     end
   end
 

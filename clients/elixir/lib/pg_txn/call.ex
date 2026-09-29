@@ -25,7 +25,7 @@ defmodule PgTxn.Call do
   """
   @spec call((-> term), keyword) :: outcome
   def call(thunk, opts) do
-    timeout = Keyword.get(opts, :timeout_ms, 30_000)
+    timeout = opts[:timeout_ms] || 30_000
     retry = Keyword.get(opts, :retry, false)
     proc =
       PgTxn.Proc.async(fn ->
@@ -107,6 +107,12 @@ defmodule PgTxn.Call do
       r when is_boolean(r) or is_nil(r) -> :ok
       [attempts: n] when is_integer(n) and n >= 1 and n <= 1000 -> :ok
       r -> raise ArgumentError, "pg_txn: :retry must be true, false or [attempts: 1..1000], got #{inspect(r)}"
+    end
+
+    case opts[:timeout_ms] do
+      nil -> :ok
+      ms when is_integer(ms) and ms > 0 -> :ok
+      ms -> raise ArgumentError, "pg_txn: :timeout_ms must be a positive integer (or nil: 30000), got #{inspect(ms)}"
     end
   end
 

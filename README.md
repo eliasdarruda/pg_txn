@@ -202,7 +202,9 @@ Every replica runs its share of the work, so add or remove replicas freely.
   work finish.
 - **A killed replica:** its named transactions are resumed by the others,
   with the same idempotency keys. Its inline transactions are abandoned and
-  their keys released.
+  their keys released. The same happens to a replica that is alive but stops
+  renewing its lease (a blocked event loop); if one of its calls still
+  succeeds afterwards, the result is recorded and the call compensated.
 - **Poolers:** everything works behind PgBouncer or RDS Proxy. Set
   `listen: false` so the optional LISTEN connection is not pinned.
 
@@ -232,6 +234,7 @@ concurrent clients
 | pg_txn: read + one effect + write back | 4.2 ms | 760–1,440 tx/s |
 | hand-rolled LISTEN/NOTIFY outbox, commit → delivery | 0.26 ms | 900–1,700 events/s |
 | pg_txn `spawn()`, commit → delivery | 1–2 ms | ~1,800 events/s |
+| pg_txn: 100 concurrent transactions on one key (one process) | | ~190 tx/s |
 
 The effect's own duration is not in the table, because pg_txn holds nothing
 while it runs.

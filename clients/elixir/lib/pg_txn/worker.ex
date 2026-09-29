@@ -25,21 +25,31 @@ defmodule PgTxn.Worker do
   @seen_every 10_000
 
   @doc false
+  # the worker and the Repo's PgTxn.KeyQueue, which outlives the worker's
+  # shutdown (callers waiting in it then leave)
   def child_spec(opts) do
     repo = Keyword.fetch!(opts, :repo)
+    shutdown = Config.get(repo, :drain_ms) + 5_000
+
+    worker = %{
+      id: __MODULE__,
+      start: {GenServer, :start_link, [__MODULE__, repo, [name: name(repo)]]},
+      # draining happens in terminate/2
+      shutdown: shutdown
+    }
 
     %{
       id: {__MODULE__, repo},
-      start: {__MODULE__, :start_link, [opts]},
-      # draining happens in terminate/2
-      shutdown: Config.get(repo, :drain_ms) + 5_000
+      type: :supervisor,
+      start: {Supervisor, :start_link, [[{PgTxn.KeyQueue, repo}, worker], [strategy: :rest_for_one]]},
+      shutdown: shutdown + 1_000
     }
   end
 
-  @doc "Starts the worker of `opts[:repo]`."
+  @doc "Starts the worker of `opts[:repo]` (and its key queue)."
   def start_link(opts) do
-    repo = Keyword.fetch!(opts, :repo)
-    GenServer.start_link(__MODULE__, repo, name: name(repo))
+    %{start: {m, f, a}} = child_spec(opts)
+    apply(m, f, a)
   end
 
   @doc "The registered name of a Repo's worker."
@@ -116,6 +126,11 @@ defmodule PgTxn.Worker do
     {:noreply, state}
   end
 
+  def handle_info({:notification, _pid, _ref, "txn_done", tx_id}, state) do
+    Local.notify_done(state.repo, tx_id)
+    {:noreply, state}
+  end
+
   def handle_info({:notification, _pid, _ref, _channel, _payload}, state) do
     send(self(), :wake)
     {:noreply, state}
@@ -153,7 +168,7 @@ defmodule PgTxn.Worker do
     state = await_tasks(state, 0)
 
     cond do
-      idle?(state) ->
+      idle?(state, deadline) ->
         :ok
 
       System.monotonic_time(:millisecond) >= deadline ->
@@ -184,17 +199,22 @@ defmodule PgTxn.Worker do
     end
   end
 
-  defp idle?(state) do
-    map_size(state.tasks) == 0 and Local.busy(state.repo) == 0 and pending_local(state) == 0
+  defp idle?(state, deadline) do
+    map_size(state.tasks) == 0 and Local.busy(state.repo) == 0 and pending_local(state, deadline) == 0
   end
 
-  defp pending_local(state) do
+  # this node's spawns and compensations due within the drain window (one
+  # delayed by an hour does not hold the shutdown)
+  defp pending_local(state, deadline) do
     if Local.any?(state.repo) do
       owners = Enum.uniq([state.owner | Local.compensation_owners(state.repo)])
+      remaining = max(0, deadline - System.monotonic_time(:millisecond))
 
-      SQL.value(state.repo,
-        "SELECT count(*) FROM txn.effects WHERE local_owner = ANY ($1::text[]::uuid[]) AND kind <> 'call' AND status IN ('pending', 'retry_wait', 'running')",
-        [owners])
+      SQL.value(state.repo, """
+      SELECT count(*) FROM txn.effects WHERE local_owner = ANY ($1::text[]::uuid[]) AND kind <> 'call'
+         AND status IN ('pending', 'retry_wait', 'running')
+         AND (status = 'running' OR next_attempt_at < now() + make_interval(secs => $2 / 1000.0))
+      """, [owners, remaining])
     else
       0
     end
@@ -218,7 +238,9 @@ defmodule PgTxn.Worker do
       config = repo.config() |> Keyword.drop([:pool, :pool_size, :name]) |> Keyword.put(:auto_reconnect, true)
 
       with {:ok, pid} <- Postgrex.Notifications.start_link(config),
-           {:ok, _ref} <- Postgrex.Notifications.listen(pid, "txn_effects") do
+           {:ok, _ref} <- Postgrex.Notifications.listen(pid, "txn_effects"),
+           # wakes callers waiting for a transaction to end (a key's holder)
+           {:ok, _ref} <- Postgrex.Notifications.listen(pid, "txn_done") do
         pid
       else
         _ -> nil
@@ -376,7 +398,8 @@ defmodule PgTxn.Worker do
           end)
 
         try do
-          ctx = %{effect_id: e["id"], idempotency_key: e["id"], attempt: e["attempt"], tx_id: e["tx_id"]}
+          # a spawn made before its transaction had a durable row has tx_id NULL
+          ctx = %{effect_id: e["id"], idempotency_key: e["id"], attempt: e["attempt"], tx_id: e["tx_id"] || local.tx_id}
           o = Call.call(fn -> local.fun.(ctx, e["input"]) end, run: nil, retry: e["delivery"] == "at-least-once", timeout_ms: local.timeout_ms || 30_000)
 
           status =

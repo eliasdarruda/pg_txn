@@ -10,6 +10,7 @@ defmodule PgTxn.Local do
   #   {{:driving, tx_id}, pid}
   #   {{:call, ref}, pid}      a public call in progress (transaction/3, run/4)
   #   {:closing, true}         the worker is shutting down: new calls are refused
+  #   {{:done_waiter, tx_id, pid}, true}   pid waits for tx_id to end (NOTIFY txn_done)
 
   @doc false
   def table(repo), do: Module.concat(repo, PgTxnLocal)
@@ -53,6 +54,33 @@ defmodule PgTxn.Local do
         ArgumentError -> :ok
       end
     end
+  end
+
+  @doc "Registers the calling process to get `{:pg_txn_done, tx_id}` when `tx_id` ends."
+  def watch_done(repo, tx_id) do
+    :ets.insert(table(repo), {{:done_waiter, tx_id, self()}, true})
+  rescue
+    ArgumentError -> false
+  end
+
+  def unwatch_done(repo, tx_id) do
+    :ets.delete(table(repo), {:done_waiter, tx_id, self()})
+  rescue
+    ArgumentError -> true
+  end
+
+  @doc "Wakes (and forgets) the processes waiting for `tx_id`."
+  def notify_done(repo, tx_id) do
+    t = table(repo)
+
+    for pid <- t |> :ets.match({{:done_waiter, tx_id, :"$1"}, :_}) |> List.flatten() do
+      :ets.delete(t, {:done_waiter, tx_id, pid})
+      send(pid, {:pg_txn_done, tx_id})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   def closing(repo), do: :ets.insert(table(repo), {:closing, true})

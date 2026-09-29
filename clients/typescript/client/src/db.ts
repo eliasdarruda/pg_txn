@@ -30,14 +30,15 @@ export interface Db<T = unknown> {
   /** Runs one statement on trx, or on its own (autocommit) when trx is null. */
   query(trx: T | null, text: string, params: unknown[]): Promise<QueryResult>;
   /**
-   * Optional: calls onNotify for NOTIFY on channel (faster wake-ups than
-   * polling). connectionString: a direct database endpoint for the listening
-   * connection (poolers such as RDS Proxy pin LISTEN connections).
+   * Optional: calls onNotify for NOTIFY on any of channels (faster wake-ups
+   * than polling). connectionString: a direct database endpoint for the
+   * listening connection (poolers such as RDS Proxy pin LISTEN connections).
    */
-  listen?(channel: string, onNotify: () => void, connectionString?: string): Promise<() => Promise<void>>;
+  listen?(channels: string[], onNotify: (channel: string, payload: string) => void, connectionString?: string): Promise<() => Promise<void>>;
 }
 
-type PgClient = { query(text: string, params?: unknown[]): Promise<QueryResult>; release(): void };
+/** tx.db of a PgTxn on a node-postgres Pool: the pool client of the run. */
+export type PgClient = { query(text: string, params?: unknown[]): Promise<QueryResult>; release(): void };
 type PgPool = {
   connect(): Promise<PgClient>;
   query(text: string, params?: unknown[]): Promise<QueryResult>;
@@ -71,16 +72,19 @@ export function pgDb(pool: PgPool): Db<PgClient> {
       // no parameters: the simple protocol (allows multi-statement scripts)
       return params.length ? (trx ?? pool).query(text, params) : (trx ?? pool).query(text);
     },
-    async listen(channel, onNotify, connectionString) {
+    async listen(channels, onNotify, connectionString) {
       // a dedicated connection, outside the pool
       const pg = (await import("pg")).default;
       const client = new pg.Client((connectionString ? { connectionString } : pool.options) as never);
       client.on("error", () => {});
       await client.connect();
-      client.on("notification", (m: { channel: string }) => {
-        if (m.channel === channel) onNotify();
+      client.on("notification", (m: { channel: string; payload?: string }) => {
+        if (channels.includes(m.channel)) onNotify(m.channel, m.payload ?? "");
       });
-      await client.query(`LISTEN ${channel}`);
+      for (const channel of channels) {
+        if (!/^[a-z_]+$/.test(channel)) throw new Error(`pg_txn: bad channel name ${channel}`);
+        await client.query(`LISTEN ${channel}`);
+      }
       return async () => {
         await client.end().catch(() => {});
       };
